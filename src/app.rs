@@ -546,10 +546,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 }
                 Msg::Term(Event::Graphics { id, ok }) => {
                     log(format_args!("graphics reply for image {id}: {ok}"));
-                    if !ok && app.page.lost(id) {
-                        // The terminal dropped an image the page was drawn
-                        // with: start again from the whole page.
-                        term::write(graphics::DELETE);
+                    if app.page.reply(id, ok) {
                         new_frame = true;
                     }
                     if id == graphics::FILE_QUERY_ID {
@@ -561,6 +558,12 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 }
                 Msg::Term(Event::Focus(focused)) => {
                     log(format_args!("focused: {focused}"));
+                    if focused {
+                        // A reattached client can have the same dimensions but
+                        // no cached graphics. Repaint even if Chrome is idle.
+                        app.page.forget();
+                        new_frame = true;
+                    }
                     app.focused = focused;
                 }
                 Msg::Term(Event::PixelMouse(on)) => {
@@ -662,6 +665,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
 
         if checked.elapsed() >= TICK {
             checked = Instant::now();
+            new_frame |= app.page.expire(checked);
             // The spinner in the bar turns while a page loads.
             redraw |= app.loading;
             app.history.save_if_due();
@@ -704,7 +708,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
     };
     app.history.save();
-    app.page.close();
     app.chrome.close();
     result
 }
@@ -886,7 +889,7 @@ impl App {
                 match (self.by_file, self.png_only) {
                     (true, _) => "by file, changed blocks only".to_owned(),
                     (false, false) => "through the pty, what moved or changed".to_owned(),
-                    (false, true) => "through the pty, whole PNG frames (KB_TRANSFER=png)".to_owned(),
+                    (false, true) => "through the pty, whole PNG frames".to_owned(),
                 },
             ),
             ("agents", format!("kb ctl -i {} ...   (kb ctl --help)", self.instance)),
@@ -1079,6 +1082,10 @@ impl App {
                 (false, true) => Route::Png,
             };
             let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2);
+            if self.page.files_failed {
+                self.by_file = false;
+                self.png_only = true;
+            }
             log(format_args!("drew {drawn}"));
         }
         let cols = self.window.cols as usize;

@@ -154,7 +154,11 @@ impl Bench {
         loop {
             if let Some(at) = self.replies.windows(REPLY.len()).position(|w| w == REPLY) {
                 let read: Vec<u8> = self.replies.drain(..at + REPLY.len()).collect();
-                self.errors += read.windows(3).filter(|w| w == b"\x1b_G").count();
+                self.errors += term::input::Parser::default()
+                    .feed(&read)
+                    .iter()
+                    .filter(|event| matches!(event, term::input::Event::Graphics { ok: false, .. }))
+                    .count();
                 return Ok(());
             }
             match self.next(deadline) {
@@ -342,6 +346,7 @@ fn run_modes(
             term::write(&out);
             bench.answered(Duration::from_secs(10))?;
             let done = Instant::now();
+            files.finish_batch();
 
             let ms = |from: Instant, to: Instant| (to - from).as_secs_f64() * 1000.0;
             samples.push(Sample {

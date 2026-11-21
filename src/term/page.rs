@@ -3,6 +3,13 @@
 
 use super::graphics::{self, Tiles};
 use super::layers::Layers;
+use std::time::{Duration, Instant};
+
+// A lost reply must not leave a static page waiting for more Chrome frames.
+const FILE_TIMEOUT: Duration = Duration::from_secs(2);
+// Rex can accept a transfer while an attached client loses its placement.
+// Bound how long a visible page can depend on an older base image.
+const PATCH_LIFETIME: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct PageImage {
@@ -13,8 +20,11 @@ pub struct PageImage {
     /// sent, when it is drawn that way (the terminal can't read files, as
     /// over ssh).
     layers: Layers,
-    /// The last frame written whole to a file.
-    last_file: Option<std::path::PathBuf>,
+    sent: Option<Instant>,
+    first_patch: Option<Instant>,
+    /// Chrome or the pane changed while the terminal was reading a batch.
+    deferred: bool,
+    pub files_failed: bool,
     /// Which drew the images on screen, if any.
     on_screen: Option<Drawer>,
 }
@@ -47,17 +57,49 @@ impl PageImage {
         self.tiles.forget();
         self.layers.forget();
         self.on_screen = None;
+        self.first_patch = None;
     }
 
-    /// The terminal reported an error for image `id`. True if the page was
-    /// drawn with it, and has been forgotten: the caller should clear the
-    /// screen of images and draw the frame again.
-    pub fn lost(&mut self, id: u32) -> bool {
-        let lost = self.layers.lost(id);
-        if lost {
+    /// True when the caller should redraw Chrome's latest frame, including
+    /// when a delayed reader has just finished and Chrome is already idle.
+    pub fn reply(&mut self, id: u32, ok: bool) -> bool {
+        if let Some(index) = self.files.pending.iter().position(|(image, _)| *image == id) {
+            if !ok {
+                self.fallback();
+                return true;
+            }
+            self.files.pending.swap_remove(index);
+            if self.files.pending.is_empty() {
+                self.sent = None;
+                return std::mem::take(&mut self.deferred);
+            }
+        } else if !ok && self.on_screen == Some(Drawer::Layers) && self.layers.lost(id) {
             self.forget();
+            return true;
         }
-        lost
+        false
+    }
+
+    pub fn expire(&mut self, now: Instant) -> bool {
+        if self.sent.is_some_and(|sent| now.duration_since(sent) >= FILE_TIMEOUT) {
+            self.fallback();
+            return true;
+        }
+        if self.first_patch.is_some_and(|at| now.duration_since(at) >= PATCH_LIFETIME) {
+            self.forget();
+            return true;
+        }
+        false
+    }
+
+    fn fallback(&mut self) {
+        // No later transfers use these IDs for acknowledged files, so a
+        // delayed reply cannot acknowledge a different generation.
+        self.files_failed = true;
+        self.files.finish_batch();
+        self.deferred = false;
+        self.sent = None;
+        self.forget();
     }
 
     /// Hand the screen to `drawer`. Each knows only its own images, so when
@@ -68,13 +110,6 @@ impl PageImage {
             out.extend_from_slice(graphics::DELETE);
             self.forget();
             self.on_screen = Some(drawer);
-        }
-    }
-
-    /// Remove the last frame's file, should the terminal not have.
-    pub fn close(&mut self) {
-        if let Some(path) = self.last_file.take() {
-            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -94,6 +129,12 @@ impl PageImage {
         cell: (u32, u32),
         top: u16,
     ) -> String {
+        if self.sent.is_some() {
+            self.deferred = true;
+            return "waiting for terminal to read the previous frame".to_owned();
+        }
+        let route = if self.files_failed { Route::Png } else { route };
+        let start = out.len();
         let mut pixels = match route {
             Route::Files => crate::base64::decode(png).and_then(|bytes| graphics::decode_png(&bytes, Vec::new())),
             Route::Layers | Route::Png => None,
@@ -108,36 +149,47 @@ impl PageImage {
             _ => Drawer::Whole,
         };
         self.hand_to(out, drawer);
+        let before_draw = out.len();
         let drawn = match drawer {
             Drawer::Tiles => pixels
                 .take()
                 .and_then(|pixels| self.tiles.draw(out, &mut self.files, pixels, cols, rows, cell, top))
-                .map(|sent| format!("{sent:?}")),
-            Drawer::Layers => self.layers.draw(out, png, cols, rows, cell, top).map(|sent| format!("{sent:?}")),
+                .map(|sent| (sent == graphics::Drawn::Whole, format!("{sent:?}"))),
+            Drawer::Layers => self
+                .layers
+                .draw(out, png, cols, rows, cell, top)
+                .map(|sent| (matches!(sent, super::layers::Sent::Whole(_)), format!("{sent:?}"))),
             Drawer::Whole => None,
         };
-        if let Some(drawn) = drawn {
+        if let Some((whole, drawn)) = drawn {
+            if whole {
+                self.first_patch = None;
+            } else if out.len() > before_draw {
+                self.first_patch.get_or_insert_with(Instant::now);
+            }
+            if !self.files.pending.is_empty() {
+                self.sent = Some(Instant::now());
+            }
             return drawn;
         }
-        // Tiles couldn't write a file, or layers decode the frame: the
-        // screen is in no known state, so it is cleared for the frame whole.
+        if drawer == Drawer::Tiles {
+            // A batch may fail halfway through preparation. Its escapes have
+            // not been written yet; discard them with the unsubmitted files.
+            out.truncate(start);
+            self.fallback();
+        }
         self.hand_to(out, Drawer::Whole);
         out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
-        match pixels.and_then(|pixels| self.files.write(&pixels.data).ok().map(|path| (pixels, path))) {
-            Some((pixels, path)) => {
-                graphics::put_file(out, &path, &pixels, cols, rows);
-                // The terminal deletes each file once read; this covers one
-                // it didn't get to.
-                if let Some(old) = self.last_file.replace(path) {
-                    let _ = std::fs::remove_file(old);
-                }
-                "the whole frame, by file".to_owned()
+        if let Some(pixels) = pixels {
+            if let Ok(path) = self.files.page_file(graphics::IMAGE_ID, &pixels.data) {
+                graphics::put_file(out, path, &pixels, cols, rows);
+                self.sent = Some(Instant::now());
+                return "the whole frame, by file".to_owned();
             }
-            None => {
-                graphics::put_png(out, png, cols, rows);
-                "the whole frame, through the pty".to_owned()
-            }
+            self.fallback();
         }
+        graphics::put_png(out, png, cols, rows);
+        "the whole frame, through the pty".to_owned()
     }
 }
 
@@ -162,6 +214,10 @@ mod tests {
         let mut out = Vec::new();
         let drawn = image.draw(&mut out, &encode(new), route, false, COLS, ROWS, CELL, 2);
         screen.feed(&out, CELL);
+        let ids: Vec<_> = image.files.pending.iter().map(|(id, _)| *id).collect();
+        for id in ids {
+            assert!(!image.reply(id, true));
+        }
         assert!(screen.page(2, CELL, 16, 40) == new.data, "after {drawn}");
         String::from_utf8(out).unwrap()
     }
@@ -186,6 +242,101 @@ mod tests {
         shows(&mut image, &mut screen, &page(16, 0), Route::Layers);
         shows(&mut image, &mut screen, &page(16, 3), Route::Files);
         shows(&mut image, &mut screen, &page(16, 6), Route::Files);
+    }
+
+    #[test]
+    fn a_slow_reader_keeps_the_base_until_it_can_apply_the_next_frame() {
+        let (mut image, mut screen) = (PageImage::default(), Screen::default());
+        let mut base = Vec::new();
+        let mut newer = Vec::new();
+        let draw = |image: &mut PageImage, out: &mut Vec<u8>, scroll| {
+            image.draw(out, &encode(&page(16, scroll)), Route::Files, false, COLS, ROWS, CELL, 2)
+        };
+        draw(&mut image, &mut base, 0);
+        draw(&mut image, &mut newer, 4);
+        // Rex receives the first filename after Chrome has produced a newer frame.
+        assert!(newer.is_empty());
+        assert!(!image.reply(999, true));
+        screen.feed(&base, CELL);
+        assert_eq!(screen.page(2, CELL, 16, 40), page(16, 0).data);
+        assert!(image.reply(graphics::IMAGE_ID, true));
+        shows(&mut image, &mut screen, &page(16, 4), Route::Files);
+    }
+
+    #[test]
+    fn missing_or_rejected_file_reply_recovers_even_when_chrome_is_idle() {
+        for timeout in [false, true] {
+            let (mut image, mut screen) = (PageImage::default(), Screen::default());
+            let png = encode(&page(16, 0));
+            let mut lost = Vec::new();
+            image.draw(&mut lost, &png, Route::Files, true, COLS, ROWS, CELL, 2);
+            let path = image.files.pending[0].1.to_path_buf();
+            assert!(path.exists());
+            assert!(String::from_utf8_lossy(&lost).contains("q=0"));
+            let sent = image.sent.unwrap();
+            assert!(!image.expire(sent));
+            if timeout {
+                assert!(image.expire(sent + FILE_TIMEOUT));
+            } else {
+                assert!(image.reply(graphics::IMAGE_ID, false));
+            }
+            assert!(!path.exists());
+            assert!(!image.reply(graphics::IMAGE_ID, true));
+            let recovered = shows(&mut image, &mut screen, &page(16, 0), Route::Files);
+            assert!(recovered.contains("f=100"));
+            assert!(!recovered.contains("t=t"));
+            assert!(!image.expire(sent + PATCH_LIFETIME));
+        }
+    }
+
+    #[test]
+    fn focus_or_resize_during_delivery_waits_for_the_old_ack_then_rebuilds() {
+        let mut image = PageImage::default();
+        let mut screen = Screen::default();
+        let png = encode(&page(16, 0));
+        let mut old = Vec::new();
+        image.draw(&mut old, &png, Route::Files, false, COLS, ROWS, CELL, 2);
+        image.forget();
+        let mut new = Vec::new();
+        image.draw(&mut new, &png, Route::Files, false, COLS, ROWS, CELL, 2);
+        assert!(new.is_empty());
+        screen.feed(&old, CELL);
+        assert!(image.reply(graphics::IMAGE_ID, true));
+        screen = Screen::default();
+        let rebuilt = shows(&mut image, &mut screen, &page(16, 0), Route::Files);
+        assert!(rebuilt.contains("t=t,i=1,"));
+    }
+
+    #[test]
+    fn reconstructs_silently_lost_base_after_partial_updates() {
+        let cell = (2, 4);
+        let (cols, rows) = (30, 14);
+        let mut image = PageImage::default();
+        let mut screen = Screen::default();
+        let mut pixels = frame(60, 56, |_, _| 5);
+        let draw = |image: &mut PageImage, screen: &mut Screen, pixels: &graphics::Pixels| {
+            let mut out = Vec::new();
+            image.draw(&mut out, &encode(pixels), Route::Files, false, cols, rows, cell, 2);
+            screen.feed(&out, cell);
+        };
+        draw(&mut image, &mut screen, &pixels);
+        assert!(!image.reply(graphics::IMAGE_ID, true));
+        // The server acknowledged the base but the client lost its graphics.
+        screen = Screen::default();
+        pixels.data[0] = 1;
+        *pixels.data.last_mut().unwrap() = 9;
+        draw(&mut image, &mut screen, &pixels);
+        assert_ne!(screen.page(2, cell, 60, 56), pixels.data);
+        assert_eq!(image.files.pending.len(), 2);
+        let second = image.files.pending[1].0;
+        let first = image.files.pending[0].0;
+        assert!(!image.reply(second, true));
+        assert!(!image.reply(first, true));
+        assert!(image.expire(image.first_patch.unwrap() + PATCH_LIFETIME));
+        draw(&mut image, &mut screen, &pixels);
+        assert_eq!(screen.page(2, cell, 60, 56), pixels.data);
+        assert!(!image.reply(graphics::IMAGE_ID, true));
+        assert!(!image.expire(Instant::now() + PATCH_LIFETIME));
     }
 
     #[test]
