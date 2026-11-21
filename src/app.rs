@@ -176,6 +176,8 @@ enum Msg {
     /// A command from `kb ctl` or the MCP server.
     Control(Request),
     ChromeClosed,
+    OutputReady,
+    OutputFailed,
 }
 
 /// How often to check whether the pane changed size.
@@ -205,6 +207,7 @@ fn log(line: std::fmt::Arguments) {
 }
 
 struct App {
+    output: term::PendingOutput,
     wheel_step: f64,
     chrome: Chrome,
     scale: f64,
@@ -366,6 +369,7 @@ fn browse(
     });
 
     let (chrome, mut receiver) = Chrome::launch(profile, options.scale, options.devtools)?;
+    let written = tx.clone();
     std::thread::spawn(move || {
         while let Ok(Some(message)) = receiver.recv() {
             if tx.send(Msg::Chrome(message)).is_err() {
@@ -376,6 +380,7 @@ fn browse(
     });
 
     let mut app = App {
+        output: Default::default(),
         wheel_step: f64::from(wheel_step),
         chrome,
         scale: options.scale,
@@ -444,7 +449,26 @@ fn browse(
         Some(url) => app.navigate(&url),
         None => app.bar.focus(),
     }
-    app.draw(false);
+    // The initial bar is small. Once the page is streaming, only the writer
+    // touches stdout so a full PTY cannot delay forwarding input to Chrome.
+    term::write(&app.draw(false));
+    let (frames, incoming) = mpsc::sync_channel::<Vec<u8>>(1);
+    let writer = std::thread::spawn(move || {
+        for frame in incoming {
+            let mut out = std::io::stdout().lock();
+            if let Err(error) = out.write_all(&frame).and_then(|()| out.flush()) {
+                let _ = written.send(Msg::OutputFailed);
+                return Err(error);
+            }
+            if written.send(Msg::OutputReady).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    let mut writing = false;
+    let (mut new_frame, mut redraw) = (false, false);
 
     let mut wheel = crate::scroll::WheelScroll::default();
     let mut checked = Instant::now();
@@ -463,7 +487,6 @@ fn browse(
         }
         messages.extend(rx.try_iter());
 
-        let (mut new_frame, mut redraw) = (false, false);
         let mut quit = None;
         let count = messages.len();
         if messages.iter().any(|message| {
@@ -529,6 +552,7 @@ fn browse(
                     // Any key closes the help, and does nothing else.
                     if app.help && app.bindings.action(&key, false) != Some(Action::Quit) {
                         app.close_help();
+                        redraw = true;
                         continue;
                     }
                     if app.on_key(key) {
@@ -671,7 +695,13 @@ fn browse(
                         None => {}
                     }
                 }
-                Msg::TermClosed => {
+                Msg::OutputReady => {
+                    writing = false;
+                    app.page.written(Instant::now());
+                }
+                // Join the writer below to collect its error, even if the
+                // terminal closed or the user quit in the same batch.
+                Msg::OutputFailed | Msg::TermClosed => {
                     quit = Some(Ok(()));
                     break;
                 }
@@ -710,7 +740,7 @@ fn browse(
                 }
                 app.window = window;
                 if window.width_px == 0 {
-                    term::query_cell_size();
+                    app.output.query_cell = true;
                 }
                 app.layout();
                 // Whatever was on screen is at the old size: start clean.
@@ -721,10 +751,20 @@ fn browse(
         if let Some(tick) = wheel.due(Instant::now()) {
             redraw |= app.on_mouse(tick);
         }
-        if new_frame || redraw {
-            app.draw(new_frame);
+        // An encoded delta becomes part of the terminal's history. Only build
+        // it when the previous write has finished. While busy, app.frame and
+        // the dirty flags describe the latest view without queueing stale deltas.
+        if !writing && (new_frame || redraw || app.output.any()) {
+            if frames.send(app.draw(new_frame)).is_err() {
+                break Err("terminal writer stopped".to_owned());
+            }
+            writing = true;
+            new_frame = false;
+            redraw = false;
         }
-        // One frame per gap, or all of them while the page is in use.
+        // Keep receiving Chrome updates while stdout is busy. If we withhold
+        // acknowledgements, Chrome can miss the final change to a static page.
+        // Only app.frame, the latest snapshot, is retained for the next draw.
         while app.chrome.ack_pending() && app.last_ack.elapsed() >= app.frame_gap() {
             app.chrome.ack();
             if !app.frame_gap().is_zero() {
@@ -732,8 +772,18 @@ fn browse(
             }
         }
     };
+    // Finish already-started escapes before restoring the user's terminal or
+    // dropping the private files they refer to. Honour a copy just before quit.
+    if app.output.clipboard.is_some() {
+        let mut last = Vec::new();
+        app.output.append(&mut last);
+        let _ = frames.send(last);
+    }
+    drop(frames);
+    let joined = writer.join();
     app.history.save();
     app.chrome.close();
+    joined.map_err(|_| "terminal writer panicked".to_owned())?.map_err(|e| format!("writing the terminal: {e}"))?;
     result
 }
 
@@ -765,8 +815,7 @@ impl App {
     /// Wipe the screen, images included. The help, if shown, is drawn
     /// again with the next frame.
     fn clear(&mut self) {
-        term::write(b"\x1b[2J");
-        term::write(graphics::DELETE);
+        self.output.clear = true;
         self.page.forget();
         self.help_rect = None;
     }
@@ -947,13 +996,13 @@ impl App {
 
     /// Draw the help box, if it is open, over whatever is below the bar.
     fn render_help(&mut self, out: &mut Vec<u8>) {
+        if let Some(old) = self.help_rect.take() {
+            ui::blank(out, old);
+        }
         if !self.help {
             return;
         }
         let lines = self.panel.clone().unwrap_or_else(|| self.help_lines());
-        if let Some(old) = self.help_rect.take() {
-            ui::blank(out, old);
-        }
         self.help_rect = Some(ui::render_box(out, &lines, self.window.cols, self.window.rows));
         // The box, not the address field, has the user's attention.
         out.extend_from_slice(b"\x1b[?25l");
@@ -1002,11 +1051,6 @@ impl App {
         self.help = false;
         if self.panel.take().is_some() {
             self.chrome.evaluate(UNHOVER);
-        }
-        if let Some(rect) = self.help_rect.take() {
-            let mut out = Vec::new();
-            ui::blank(&mut out, rect);
-            term::write(&out);
         }
     }
 
@@ -1060,9 +1104,10 @@ impl App {
         self.chrome.navigate(url);
     }
 
-    fn draw(&mut self, frame: bool) {
+    fn draw(&mut self, frame: bool) -> Vec<u8> {
         // Synchronized update, so the terminal shows the result in one go.
         let mut out = b"\x1b[?2026h".to_vec();
+        self.output.append(&mut out);
         let cell = self.cell();
         if let Some(png) = self.frame.as_deref().filter(|_| frame) {
             let (cols, rows) = self.shown;
@@ -1109,7 +1154,7 @@ impl App {
         }
         self.render_help(&mut out);
         out.extend_from_slice(b"\x1b[?2026l");
-        term::write(&out);
+        out
     }
 
     /// Open the find field in the address bar's place.
@@ -1263,7 +1308,7 @@ impl App {
             self.note("Nothing to copy");
             return;
         }
-        term::copy(text);
+        self.output.clipboard = Some(text.to_owned());
         let count = text.chars().count();
         self.note(&format!("Copied {count} character{}", if count == 1 { "" } else { "s" }));
     }
@@ -1334,7 +1379,7 @@ impl App {
         if self.pointer != shape {
             log(format_args!("pointer {shape}"));
             self.pointer = shape.to_owned();
-            term::pointer(shape);
+            self.output.pointer = Some(shape.to_owned());
         }
     }
 
@@ -1375,6 +1420,7 @@ impl App {
         if self.help {
             if mouse.kind == MouseKind::Press {
                 self.close_help();
+                return true;
             }
             return false;
         }
