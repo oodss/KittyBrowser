@@ -122,8 +122,9 @@ pub(super) fn run(mut page: PageImage, jobs: mpsc::Receiver<Command>, events: &m
                 let mut out = io::stdout().lock();
                 out.write_all(&bytes)?;
                 out.flush()?;
-                page.written(Instant::now());
-                if events.send(Msg::OutputReady { files_failed: page.files_failed }).is_err() {
+                let written_at = Instant::now();
+                page.written(written_at);
+                if events.send(Msg::OutputReady { files_failed: page.files_failed, written_at }).is_err() {
                     break;
                 }
             }
