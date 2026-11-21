@@ -22,6 +22,13 @@ frames arrived, only the newest is drawn, and a burst of mouse moves collapses
 to the last one. Writing a frame to the terminal blocks until the terminal has
 taken it, which is what keeps a slow terminal from falling behind.
 
+Rex and other SGR terminals report scrolling as discrete wheel ticks. The
+first tick goes straight to Chrome. At a fixed pointer position, subsequent
+ticks with the same direction and modifiers are combined over 16 ms. The
+timer also drains the last ticks when Chrome is idle. Reversing direction
+discards pending motion in the old direction. Keyboard input, clicks, and
+changes of target or modifiers retain their ordering.
+
 ## Startup
 
 Before Chrome starts, kb asks the terminal whether it draws kitty graphics
