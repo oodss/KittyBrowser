@@ -212,8 +212,11 @@ impl App {
                 return true;
             }
             let frame = &packet["params"];
+            // Chrome can pause the renderer for a site dialog while the user
+            // is browsing. Release the chooser so the dialog can be answered.
             if packet["sessionId"] == p.session
-                && ((packet["method"] == "Page.frameNavigated" && frame["frame"]["id"] == p.frame)
+                && (packet["method"] == "Page.javascriptDialogOpening"
+                    || (packet["method"] == "Page.frameNavigated" && frame["frame"]["id"] == p.frame)
                     || (packet["method"] == "Page.frameDetached" && frame["frameId"] == p.frame))
             {
                 self.picker = None;
