@@ -240,6 +240,15 @@ struct TabButtonPress {
     drawn_at: Option<Instant>,
 }
 
+impl TabButtonPress {
+    fn is_retry(&self, mouse: Mouse, at: Instant, column: Option<usize>, cols: usize) -> bool {
+        mouse.button == Some(self.button)
+            && matches!(mouse.kind, MouseKind::Press | MouseKind::Release)
+            && self.drawn_at.is_none_or(|drawn| at <= drawn)
+            && column.is_some_and(|col| ui::hit(col, cols, self.windows) == Hit::NewTab)
+    }
+}
+
 struct App {
     output: term::PendingOutput,
     downloads: downloads::Downloads,
@@ -1732,12 +1741,7 @@ impl App {
 
     fn consume_tab_retry(&mut self, mouse: Mouse, at: Instant) -> bool {
         let Some(press) = &self.tab_button else { return false };
-        let repeated = mouse.button == Some(press.button)
-            && matches!(mouse.kind, MouseKind::Press | MouseKind::Release)
-            && press.drawn_at.is_none_or(|drawn| at <= drawn)
-            && self
-                .toolbar_column(mouse)
-                .is_some_and(|col| ui::hit(col, self.window.cols as usize, press.windows) == Hit::NewTab);
+        let repeated = press.is_retry(mouse, at, self.toolbar_column(mouse), self.window.cols as usize);
         // A repeat still belongs to the same open request after a slow
         // attach. Start the lost-reply timeout from the last such press.
         if repeated && mouse.kind == MouseKind::Press {
@@ -1965,5 +1969,60 @@ mod clipboard_tests {
         assert!(!super::CopyRequest::consume(&mut pending, 16));
         assert!(super::CopyRequest::consume(&mut pending, 17));
         assert!(!super::CopyRequest::consume(&mut pending, 17));
+    }
+}
+
+#[cfg(test)]
+mod tab_button_tests {
+    use super::*;
+
+    fn left_press() -> Mouse {
+        Mouse { kind: MouseKind::Press, button: Some(Button::Left), x: 77, y: 1, ctrl: false, alt: false, shift: false }
+    }
+
+    #[test]
+    fn retries_end_at_the_writer_timestamp() {
+        let before = Instant::now();
+        let drawn = before + Duration::from_millis(1);
+        let after = drawn + Duration::from_nanos(1);
+        let mut press = TabButtonPress { request: 1, windows: (1, 1), button: Button::Left, drawn_at: None };
+        for kind in [MouseKind::Press, MouseKind::Release] {
+            let mouse = Mouse { kind, ..left_press() };
+            assert!(press.is_retry(mouse, before, Some(77), 80));
+        }
+        press.drawn_at = Some(drawn);
+        for kind in [MouseKind::Press, MouseKind::Release] {
+            let mouse = Mouse { kind, ..left_press() };
+            assert!(press.is_retry(mouse, before, Some(77), 80));
+            assert!(press.is_retry(mouse, drawn, Some(77), 80));
+            assert!(!press.is_retry(mouse, after, Some(77), 80));
+        }
+    }
+
+    #[test]
+    fn queued_click_uses_the_toolbar_layout_seen_at_press() {
+        let at = Instant::now();
+        let single = TabButtonPress { request: 1, windows: (1, 1), button: Button::Left, drawn_at: None };
+        let multiple = TabButtonPress { windows: (2, 2), ..single };
+        assert!(single.is_retry(left_press(), at, Some(77), 80));
+        assert!(!multiple.is_retry(left_press(), at, Some(77), 80));
+        assert!(!single.is_retry(left_press(), at, Some(70), 80));
+        assert!(multiple.is_retry(left_press(), at, Some(70), 80));
+    }
+
+    #[test]
+    fn unrelated_input_remains_available() {
+        let at = Instant::now();
+        let press = TabButtonPress { request: 1, windows: (1, 1), button: Button::Right, drawn_at: None };
+        let restore = Mouse { button: Some(Button::Right), ..left_press() };
+        assert!(press.is_retry(restore, at, Some(77), 80));
+        for button in [Some(Button::Left), Some(Button::Middle), None] {
+            assert!(!press.is_retry(Mouse { button, ..restore }, at, Some(77), 80));
+        }
+        for kind in [MouseKind::Move, MouseKind::Wheel(0, 1)] {
+            assert!(!press.is_retry(Mouse { kind, ..restore }, at, Some(77), 80));
+        }
+        assert!(!press.is_retry(restore, at, None, 80));
+        assert!(!press.is_retry(restore, at, Some(80), 80));
     }
 }
