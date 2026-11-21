@@ -104,7 +104,9 @@ impl Bench {
     /// The next message, with Chrome's digested into what happened on the
     /// page. `Ok(None)` is a message of no interest.
     fn next(&mut self, deadline: Instant) -> Result<Option<PageEvent>, String> {
-        let wait = deadline.saturating_duration_since(Instant::now());
+        self.chrome.retry_capture_if_due();
+        let wake = self.chrome.capture_retry_at().map_or(deadline, |retry| retry.min(deadline));
+        let wait = wake.saturating_duration_since(Instant::now());
         match self.rx.recv_timeout(wait) {
             Ok(Msg::Chrome(message)) => Ok(self.chrome.handle(message)),
             Ok(Msg::Term(bytes)) => {
@@ -112,6 +114,7 @@ impl Bench {
                 Ok(None)
             }
             Ok(Msg::ChromeClosed) | Err(RecvTimeoutError::Disconnected) => Err("Chrome exited".into()),
+            Err(RecvTimeoutError::Timeout) if wake < deadline => Ok(None),
             Err(RecvTimeoutError::Timeout) => Err("timeout".into()),
         }
     }

@@ -873,6 +873,7 @@ fn browse(
 
         if checked.elapsed() >= TICK {
             checked = Instant::now();
+            app.chrome.retry_capture_if_due();
             // The spinner in the bar turns while a page loads.
             redraw |= app.loading;
             app.history.save_if_due();
