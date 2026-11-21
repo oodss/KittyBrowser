@@ -564,6 +564,10 @@ impl Chrome {
         }
     }
 
+    pub fn intercept_files(&mut self) {
+        self.send_to_all("Page.setInterceptFileChooserDialog", json!({"enabled":true}));
+    }
+
     pub fn main_frame(&self) -> &str {
         &self.tabs[self.shown].main_frame
     }
