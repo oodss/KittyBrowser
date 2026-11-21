@@ -1139,21 +1139,30 @@ impl Chrome {
     /// `kind` is mousePressed, mouseReleased or mouseMoved; `button` is the
     /// one that changed (or "none"); `buttons` is the mask of those held.
     #[allow(clippy::too_many_arguments)]
-    pub fn mouse(&mut self, kind: &str, x: f64, y: f64, button: &str, buttons: u32, clicks: u32, modifiers: u32) {
-        self.send(
+    pub fn mouse(
+        &mut self,
+        kind: &str,
+        x: f64,
+        y: f64,
+        button: &str,
+        buttons: u32,
+        clicks: u32,
+        modifiers: u32,
+    ) -> u64 {
+        self.request(
             "Input.dispatchMouseEvent",
             json!({
                 "type": kind, "x": x, "y": y, "button": button, "buttons": buttons,
                 "clickCount": clicks, "modifiers": modifiers,
             }),
-        );
+        )
     }
 
-    pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) {
-        self.send(
+    pub fn wheel(&mut self, x: f64, y: f64, dx: f64, dy: f64, modifiers: u32) -> u64 {
+        self.request(
             "Input.dispatchMouseEvent",
             json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy, "modifiers": modifiers}),
-        );
+        )
     }
 
     pub fn insert_text(&mut self, text: &str) {

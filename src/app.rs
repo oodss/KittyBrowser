@@ -177,7 +177,8 @@ const DESCRIBE: &str = "(function() { const el = this, s = getComputedStyle(el),
   return {lines}; }).call(globalThis.__kbInspected)";
 
 enum Msg {
-    Term(Event),
+    Term(Event, Instant),
+    MotionReports(Arc<crate::scroll::Reports>),
     TermClosed,
     Chrome(serde_json::Value),
     /// A command from `kb ctl` or the MCP server.
@@ -188,6 +189,17 @@ enum Msg {
     },
     Repaint,
     OutputFailed,
+}
+
+impl Msg {
+    fn receive(self, messages: &mut Vec<Self>) {
+        match self {
+            Self::MotionReports(batch) => {
+                messages.extend(batch.take().into_iter().map(|(m, at)| Self::Term(Event::Mouse(m), at)))
+            }
+            other => messages.push(other),
+        }
+    }
 }
 
 /// How often to check whether the pane changed size.
@@ -221,6 +233,8 @@ struct App {
     output: term::PendingOutput,
     downloads: downloads::Downloads,
     wheel_step: f64,
+    wheel: crate::scroll::Lane,
+    hover: crate::scroll::Lane,
     scroll_capture: crate::scroll::ScrollCapture,
     preview_enabled: bool,
     chrome: Chrome,
@@ -279,7 +293,7 @@ struct App {
     notice: Option<(String, Instant)>,
     /// The request for the pointer shape under the mouse, and where to ask
     /// next once it is answered.
-    pointer_request: Option<u64>,
+    pointer_request: Option<(u64, (f64, f64))>,
     pointer_next: Option<(f64, f64)>,
     pointer: String,
     /// The terminal's text and background colours, once it has said.
@@ -364,13 +378,33 @@ fn browse(
     let input = tx.clone();
     std::thread::spawn(move || {
         let mut parser = Parser::default();
+        let mut motion = Arc::new(crate::scroll::Reports::default());
         let mut buf = [0; 4096];
         let mut stdin = std::io::stdin().lock();
         loop {
             match stdin.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    let arrived = Instant::now();
                     for event in parser.feed(&buf[..n]) {
-                        if input.send(Msg::Term(event)).is_err() {
+                        let message = match event {
+                            Event::Mouse(
+                                mouse @ Mouse { kind: MouseKind::Wheel(..) | MouseKind::Move, button: None, .. },
+                            ) => {
+                                if !motion.push(mouse, arrived) {
+                                    continue;
+                                }
+                                Msg::MotionReports(Arc::clone(&motion))
+                            }
+                            other => {
+                                // A key, drag, click or terminal reply seals the preceding
+                                // batch so later movement cannot overtake it in the channel.
+                                if Arc::strong_count(&motion) > 1 {
+                                    motion = Arc::new(Default::default());
+                                }
+                                Msg::Term(other, arrived)
+                            }
+                        };
+                        if input.send(message).is_err() {
                             return;
                         }
                     }
@@ -398,6 +432,8 @@ fn browse(
         output: Default::default(),
         downloads: Default::default(),
         wheel_step: f64::from(wheel_step),
+        wheel: Default::default(),
+        hover: Default::default(),
         scroll_capture: Default::default(),
         preview_enabled: std::env::var_os("KB_SCROLL_PREVIEW").as_deref() != Some(std::ffi::OsStr::new("0")),
         chrome,
@@ -490,7 +526,6 @@ fn browse(
     let mut writing = true;
     let (mut new_frame, mut redraw) = (false, false);
 
-    let mut wheel = crate::scroll::WheelScroll::default();
     let mut checked = Instant::now();
     let mut tab_input = Vec::new();
     let result = loop {
@@ -510,86 +545,100 @@ fn browse(
             false => TICK,
         };
         let now = Instant::now();
-        let wait = [Some(wait), wheel.wait(now), app.scroll_capture.wait(now)].into_iter().flatten().min().unwrap();
+        let wait = [Some(wait), app.wheel.wait(now), app.scroll_capture.wait(now)].into_iter().flatten().min().unwrap();
         if messages.is_empty() {
             match rx.recv_timeout(wait) {
-                Ok(message) => messages.push(message),
+                Ok(message) => message.receive(&mut messages),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break Ok(()),
             }
         }
         // A continuously busy page must still yield to wheel and frame deadlines.
-        messages.extend(rx.try_iter().take(128));
+        for message in rx.try_iter().take(128) {
+            message.receive(&mut messages);
+        }
 
         let mut quit = None;
-        let count = messages.len();
         if messages.iter().any(|message| {
-            matches!(message, Msg::Control(_) | Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_)))
+            matches!(message, Msg::Control(_) | Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_), _))
         }) {
             app.last_input = Instant::now();
         }
-        let mut messages = messages.into_iter().enumerate().peekable();
-        while let Some((index, message)) = messages.next() {
-            if let Msg::Term(event) = &message {
+        let mut messages = messages.into_iter().peekable();
+        while let Some(message) = messages.next() {
+            // Age replaceable input at the PTY reader, including events held
+            // while a tab was opening. Clicks, keys and drags retain their order.
+            if let Msg::Term(Event::Mouse(mouse), at) = &message {
+                if at.elapsed() > crate::scroll::MAX_AGE
+                    && (matches!(mouse.kind, MouseKind::Wheel(..))
+                        || (mouse.kind == MouseKind::Move && mouse.button.is_none() && app.buttons == 0))
+                {
+                    continue;
+                }
+            }
+            match &message {
+                Msg::Term(
+                    Event::Key(_)
+                    | Event::Paste(_)
+                    | Event::Mouse(Mouse { kind: MouseKind::Press | MouseKind::Release, .. }),
+                    _,
+                )
+                | Msg::Control(_) => {
+                    // Preserve the last fresh distance if Chrome is ready. A
+                    // click must never wait for a blocked wheel or hover.
+                    app.send_wheel(true);
+                    app.discard_motion();
+                }
+                Msg::Term(Event::Focus(_) | Event::PixelMouse(_) | Event::CellSize { .. }, _) => app.discard_motion(),
+                _ => {}
+            }
+            if let Msg::Term(event, _) = &message {
                 if app.picker_input(event) {
                     redraw = true;
                     continue;
                 }
             }
             if (app.opening_tab.is_some() || !tab_input.is_empty())
-                && matches!(message, Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_)))
+                && matches!(message, Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_), _))
             {
-                tab_input.push(message);
+                if !matches!(
+                    message,
+                    Msg::Term(
+                        Event::Mouse(Mouse { kind: MouseKind::Wheel(..) | MouseKind::Move, button: None, .. }),
+                        _
+                    )
+                ) {
+                    tab_input.push(message);
+                }
                 continue;
             }
-            if let Msg::Term(event) = &message {
+            if let Msg::Term(event, _) = &message {
                 if app.dialog_input(event) {
                     redraw = true;
                     continue;
                 }
             }
-            match &message {
-                Msg::Term(event) if app.download_input(event) => {
+            if let Msg::Term(event, _) = &message {
+                if app.download_input(event) {
                     redraw = true;
                     continue;
                 }
-                Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
-                    for tick in wheel.report(*mouse, Instant::now()).into_iter().flatten() {
-                        redraw |= app.on_mouse(tick);
-                    }
-                    continue;
-                }
-                Msg::Term(
-                    Event::Key(_)
-                    | Event::Paste(_)
-                    | Event::Mouse(_)
-                    | Event::Focus(_)
-                    | Event::PixelMouse(_)
-                    | Event::CellSize { .. },
-                )
-                | Msg::Control(_) => {
-                    if let Some(tick) = wheel.finish() {
-                        redraw |= app.on_mouse(tick);
-                    }
-                }
-                _ => {}
             }
             match message {
-                Msg::Term(Event::Mouse(mouse)) => {
-                    // A burst of moves collapses to the last one.
-                    let next_is_move = matches!(
+                Msg::Term(Event::Mouse(mouse), at) => {
+                    let next_is_hover = matches!(
                         messages.peek(),
-                        Some((_, Msg::Term(Event::Mouse(Mouse { kind: MouseKind::Move, .. }))))
+                        Some(Msg::Term(Event::Mouse(Mouse { kind: MouseKind::Move, button: None, .. }), _))
                     );
-                    if !(mouse.kind == MouseKind::Move && next_is_move && index + 1 < count) {
-                        redraw |= app.on_mouse(mouse);
+                    if !(next_is_hover && app.buttons == 0 && mouse.kind == MouseKind::Move && mouse.button.is_none()) {
+                        redraw |= app.on_mouse(mouse, at);
                     }
                     if app.quit_clicked {
                         quit = Some(Ok(()));
                         break;
                     }
                 }
-                Msg::Term(Event::Key(key)) if app.asking_quit => {
+                Msg::Term(Event::Key(key), _) if app.asking_quit => {
                     match key.code {
                         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
                             quit = Some(Ok(()));
@@ -604,7 +653,7 @@ fn browse(
                     }
                     redraw = true;
                 }
-                Msg::Term(Event::Key(key)) => {
+                Msg::Term(Event::Key(key), _) => {
                     // Any key closes the help, and does nothing else.
                     if app.help && app.bindings.action(&key, false) != Some(Action::Quit) {
                         app.close_help();
@@ -617,7 +666,7 @@ fn browse(
                     }
                     redraw = true;
                 }
-                Msg::Term(Event::Color { slot, rgb }) => {
+                Msg::Term(Event::Color { slot, rgb }, _) => {
                     log(format_args!("terminal colour {slot}: {rgb:?}"));
                     match slot {
                         10 => app.term_fg = Some(rgb),
@@ -626,7 +675,7 @@ fn browse(
                     app.follow_terminal_colors();
                     redraw = true;
                 }
-                Msg::Term(Event::Paste(text)) => {
+                Msg::Term(Event::Paste(text), _) => {
                     if app.find.is_some() {
                         app.find_edit(|field| field.insert(&text));
                         redraw = true;
@@ -637,7 +686,7 @@ fn browse(
                         app.chrome.insert_text(&text);
                     }
                 }
-                Msg::Term(Event::CellSize { width, height }) => {
+                Msg::Term(Event::CellSize { width, height }, _) => {
                     log(format_args!("terminal reports cell {width}x{height}"));
                     if app.reported_cell != Some((width, height)) {
                         app.reported_cell = Some((width, height));
@@ -645,7 +694,7 @@ fn browse(
                         new_frame = true;
                     }
                 }
-                Msg::Term(Event::Graphics { id, ok }) => {
+                Msg::Term(Event::Graphics { id, ok }, _) => {
                     log(format_args!("graphics reply for image {id}: {ok}"));
                     let _ = frames.send(render::Command::Reply(id, ok));
                     if id == graphics::FILE_QUERY_ID {
@@ -657,7 +706,7 @@ fn browse(
                         }
                     }
                 }
-                Msg::Term(Event::Focus(focused)) => {
+                Msg::Term(Event::Focus(focused), _) => {
                     log(format_args!("focused: {focused}"));
                     if focused {
                         // A reattached client can have the same dimensions but
@@ -671,8 +720,8 @@ fn browse(
                     }
                     app.focused = focused;
                 }
-                Msg::Term(Event::StatusOk) => receipt.received(),
-                Msg::Term(Event::PixelMouse(on)) => {
+                Msg::Term(Event::StatusOk, _) => receipt.received(),
+                Msg::Term(Event::PixelMouse(on), _) => {
                     log(format_args!("pixel mouse: {on}"));
                     app.pixel_mouse = on;
                 }
@@ -719,16 +768,21 @@ fn browse(
                         continue;
                     }
                     if app.picker_event(&message) {
+                        app.discard_motion();
                         redraw = true;
                         continue;
                     }
                     if let Some(id) = message["id"].as_u64() {
+                        if app.wheel.reply(id) || app.hover.reply(id) {
+                            continue;
+                        }
                         if app.reply(id, &message) {
                             redraw = true;
                             continue;
                         }
                     }
                     if app.dialog_event(&message) {
+                        app.discard_motion();
                         redraw = true;
                         continue;
                     }
@@ -761,12 +815,10 @@ fn browse(
                             }
                         }
                         Some(PageEvent::Url(url)) => {
-                            wheel.finish();
                             app.went_to(url);
                             redraw = true;
                         }
                         Some(PageEvent::Shown(url)) => {
-                            wheel.finish();
                             app.shown(url);
                             redraw = true;
                         }
@@ -793,6 +845,7 @@ fn browse(
                         None => {}
                     }
                 }
+                Msg::MotionReports(_) => unreachable!("expanded on receipt"),
                 Msg::Repaint => new_frame = true,
                 Msg::OutputReady { files_failed } => {
                     receipt.written(Instant::now());
@@ -837,9 +890,6 @@ fn browse(
                 redraw = true;
             }
             if let Some(window) = size::window().filter(|w| *w != app.window) {
-                if let Some(tick) = wheel.finish() {
-                    redraw |= app.on_mouse(tick);
-                }
                 app.window = window;
                 if window.width_px == 0 {
                     app.output.query_cell = true;
@@ -850,9 +900,8 @@ fn browse(
                 new_frame = true;
             }
         }
-        if let Some(tick) = wheel.due(Instant::now()) {
-            redraw |= app.on_mouse(tick);
-        }
+        app.send_wheel(false);
+        app.send_hover();
         if app.scroll_capture.unavailable(Instant::now()) {
             app.preview_enabled = false;
             app.end_scroll_capture();
@@ -940,6 +989,7 @@ impl App {
 
     /// Size the page's viewport to the cells below the top bar.
     fn layout(&mut self) {
+        self.discard_motion();
         self.end_scroll_capture();
         let (cell_w, cell_h) = self.cell();
         let (cols, rows) = (self.window.cols, self.page_rows());
@@ -1150,6 +1200,9 @@ impl App {
     /// Another window is shown, at `url`. Whether it is loading comes in
     /// its own events.
     fn shown(&mut self, url: String) {
+        self.wheel = Default::default();
+        self.hover = Default::default();
+        self.pointer_request = None;
         self.picker = None;
         self.loading = false;
         self.find = None;
@@ -1182,6 +1235,7 @@ impl App {
 
     /// The page shown is at `url` now.
     fn went_to(&mut self, url: String) {
+        self.discard_motion();
         self.end_scroll_capture();
         log(format_args!("url {url}"));
         self.pacing.reset();
@@ -1506,13 +1560,15 @@ impl App {
             }
             return true;
         }
-        if self.pointer_request == Some(id) {
+        if let Some((_, requested)) = self.pointer_request.filter(|(request, _)| *request == id) {
             self.pointer_request = None;
-            let shape = message["result"]["result"]["value"].as_str().unwrap_or("default");
-            let shape = if POINTERS.contains(&shape) { shape } else { "default" };
-            self.set_pointer(shape);
-            if let Some((x, y)) = self.pointer_next.take() {
-                self.ask_pointer(x, y);
+            if let Some(latest) = self.pointer_next.take() {
+                if latest == requested {
+                    let shape = message["result"]["result"]["value"].as_str().unwrap_or("default");
+                    self.set_pointer(if POINTERS.contains(&shape) { shape } else { "default" });
+                } else {
+                    self.ask_pointer(latest.0, latest.1);
+                }
             }
             return true;
         }
@@ -1536,11 +1592,11 @@ impl App {
 
     /// Ask which pointer the page wants at a point, one question at a time.
     fn ask_pointer(&mut self, x: f64, y: f64) {
-        if self.pointer_request.is_some() {
-            self.pointer_next = Some((x, y));
-            return;
+        self.pointer_next = Some((x, y));
+        if self.pointer_request.is_none() {
+            let id = self.chrome.evaluate_value(&format!("{POINTER}({x}, {y})"));
+            self.pointer_request = Some((id, (x, y)));
         }
-        self.pointer_request = Some(self.chrome.evaluate_value(&format!("{POINTER}({x}, {y})")));
     }
 
     fn set_pointer(&mut self, shape: &str) {
@@ -1582,8 +1638,38 @@ impl App {
         Ok(Output::Text(said))
     }
 
+    fn discard_motion(&mut self) {
+        self.wheel.clear();
+        self.hover.clear();
+        self.pointer_next = None;
+    }
+
+    fn send_wheel(&mut self, flush: bool) {
+        if let Some(crate::scroll::Motion { kind: MouseKind::Wheel(dx, dy), x, y, modifiers }) =
+            self.wheel.take(Instant::now(), flush)
+        {
+            log(format_args!("Wheel({dx}, {dy}) none at page {x:.0},{y:.0}"));
+            let id =
+                self.chrome.wheel(x, y, f64::from(dx) * self.wheel_step, f64::from(dy) * self.wheel_step, modifiers);
+            self.wheel.sent(id);
+        }
+    }
+
+    fn send_hover(&mut self) {
+        if let Some(crate::scroll::Motion { x, y, modifiers, .. }) = self.hover.take(Instant::now(), false) {
+            let id = if self.inspecting {
+                self.chrome.evaluate_value(&format!("{HOVER}({x}, {y})"))
+            } else {
+                let id = self.chrome.mouse("mouseMoved", x, y, "none", 0, 0, modifiers);
+                self.ask_pointer(x, y);
+                id
+            };
+            self.hover.sent(id);
+        }
+    }
+
     /// Returns whether the top bar needs redrawing.
-    fn on_mouse(&mut self, mouse: Mouse) -> bool {
+    fn on_mouse(&mut self, mouse: Mouse, at: Instant) -> bool {
         // A click closes the help, and does nothing else.
         if self.help {
             if mouse.kind == MouseKind::Press {
@@ -1601,6 +1687,9 @@ impl App {
         } else {
             ((mouse.x as f64 - 0.5) * cell_w, (mouse.y as f64 - 0.5) * cell_h)
         };
+        if self.asking_quit || (self.buttons == 0 && py < cell_h * if self.tab_strip { 2.0 } else { 1.0 }) {
+            self.discard_motion();
+        }
         // The mouse's back and forward buttons, as in any browser.
         if mouse.kind == MouseKind::Press {
             match mouse.button {
@@ -1716,16 +1805,18 @@ impl App {
             Some(Button::Middle) => ("middle", 4),
             Some(Button::Back | Button::Forward) | None => ("none", 0),
         };
-        if mouse.kind != MouseKind::Move {
+        if !matches!(mouse.kind, MouseKind::Move | MouseKind::Wheel(..)) {
             log(format_args!("{:?} {name} at page {x:.0},{y:.0}", mouse.kind));
         }
         // Inspect mode: the mouse points elements out, and a click picks one
         // rather than reaching the page. The wheel still scrolls.
+        let motion = crate::scroll::Motion { kind: mouse.kind, x, y, modifiers };
         if self.inspecting && !matches!(mouse.kind, MouseKind::Wheel(..)) {
             match mouse.kind {
                 MouseKind::Move => {
                     self.set_pointer("crosshair");
-                    self.chrome.evaluate(&format!("{HOVER}({x}, {y})"));
+                    self.hover.offer(motion, at);
+                    self.send_hover();
                 }
                 MouseKind::Press if mouse.button == Some(Button::Left) => {
                     self.chrome.evaluate(&format!("{HOVER}({x}, {y})"));
@@ -1761,13 +1852,16 @@ impl App {
                 self.chrome.mouse("mouseReleased", x, y, name, self.buttons, clicks, modifiers);
             }
             MouseKind::Move => {
-                self.chrome.mouse("mouseMoved", x, y, name, self.buttons, 0, modifiers);
-                if self.buttons == 0 {
-                    self.ask_pointer(x, y);
+                if self.buttons == 0 && mouse.button.is_none() {
+                    self.hover.offer(motion, at);
+                    self.send_hover();
+                } else {
+                    self.chrome.mouse("mouseMoved", x, y, name, self.buttons, 0, modifiers);
                 }
             }
-            MouseKind::Wheel(dx, dy) => {
-                self.chrome.wheel(x, y, dx as f64 * self.wheel_step, dy as f64 * self.wheel_step, modifiers);
+            MouseKind::Wheel(..) => {
+                self.wheel.offer(motion, at);
+                self.send_wheel(false);
                 let native = (
                     (self.viewport.0 as f64 * self.scale).round() as u32,
                     (self.viewport.1 as f64 * self.scale).round() as u32,
