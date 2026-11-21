@@ -22,6 +22,7 @@ pub enum Hit {
     Back,
     Forward,
     Reload,
+    Downloads,
     NewTab,
     Close,
     /// The window switcher's halves.
@@ -65,6 +66,8 @@ pub fn hit(col: usize, cols: usize, windows: (usize, usize)) -> Hit {
         }
     } else if col >= switcher_start - NEW_TAB {
         Hit::NewTab
+    } else if cols >= 32 && col >= switcher_start - NEW_TAB - 3 {
+        Hit::Downloads
     } else if (FIELD..=cols - CLOSE).contains(&col) {
         Hit::Address(col.saturating_sub(FIELD + 1))
     } else {
@@ -496,9 +499,10 @@ pub fn render_bar(
 
     let switcher = switcher(windows, cols);
     let switcher_width = switcher.as_ref().map_or(0, |text| text.chars().count());
-    let badge = badge.filter(|badge| cols > MIN_COLS + switcher_width + badge.chars().count());
+    let badge = badge.filter(|badge| cols > MIN_COLS + 3 + switcher_width + badge.chars().count());
     let badge_width = badge.map_or(0, |badge| badge.chars().count() + 1);
-    let width = cols - FIELD - 2 - CLOSE - NEW_TAB - badge_width - switcher_width;
+    let downloads_width = if cols >= 32 { 3 } else { 0 };
+    let width = cols - downloads_width - FIELD - 2 - CLOSE - NEW_TAB - badge_width - switcher_width;
     let window = bar.window(width);
     let shown: Vec<char> = bar.text.iter().chain(&bar.completion).copied().collect();
     let typed_end = bar.text.len().clamp(window.start, window.end);
@@ -519,6 +523,9 @@ pub fn render_bar(
     s.push(' ');
     if let Some(badge) = badge {
         let _ = write!(s, "{badge} ");
+    }
+    if downloads_width > 0 {
+        s.push_str(" ↓ ");
     }
     s.push_str(" + ");
     if let Some(switcher) = switcher {
@@ -775,7 +782,7 @@ mod tests {
         assert_eq!(hit(10, 80, (1, 1)), Hit::Nothing);
         assert_eq!(hit(11, 80, (1, 1)), Hit::Address(0));
         assert_eq!(hit(14, 80, (1, 1)), Hit::Address(2));
-        assert_eq!(hit(74, 80, (1, 1)), Hit::Address(62));
+        assert_eq!(hit(74, 80, (1, 1)), Hit::Downloads);
         assert_eq!(hit(77, 80, (1, 1)), Hit::NewTab);
         assert_eq!(hit(78, 80, (1, 1)), Hit::Close);
         assert_eq!(hit(80, 80, (1, 1)), Hit::Close);

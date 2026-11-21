@@ -179,6 +179,7 @@ click the address to edit it, and click, drag and scroll the page.
 | Ctrl+Shift+C or Cmd+Shift+C | Inspect: hover to outline elements, click one for its selector, size and styles |
 | F12, Ctrl+Shift+I or Cmd+Alt+I | Open Chrome DevTools for the page (start kb with `--devtools`) |
 | Ctrl+= and Ctrl+- | Zoom in and out; the zoom shows at the right of the bar |
+| Ctrl+J or ↓ in the bar | Server downloads: select a transfer, copy its saved path (C) or cancel (X) |
 | Ctrl+0 | Zoom to 100%, or out until a page too wide for the pane fits |
 | Ctrl+/ | Help: the keys, and the page, zoom, viewport and pane sizes |
 | Ctrl+T, Cmd+T | Open a tab in the current profile |
@@ -198,6 +199,7 @@ change at once.
   doesn't keep them for itself. In Rex, Cmd+F, Cmd+G and Cmd+R are Rex's own,
   so use Ctrl+F, Ctrl+G and Ctrl+R there. Ctrl+[ and Ctrl+] also need the
   protocol.
+- **Downloads** are saved under `~/.kittybrowser/downloads` on the browser host. A repeated filename gains a numeric suffix.
 - **Address completion** comes from pages you have visited, kept in
   `~/.kittybrowser/history`. Nothing you type is sent to a suggestion
   service.

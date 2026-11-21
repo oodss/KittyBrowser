@@ -4,6 +4,8 @@
 //! only what changed. Row 1 is the top bar, the page image fills the rest.
 
 use crate::control::{self, Output, Request};
+mod downloads;
+
 use crate::devtools::{Devtools, Page};
 use crate::engine::chrome::{self, Chrome, PageEvent};
 use crate::history::History;
@@ -209,6 +211,7 @@ fn log(line: std::fmt::Arguments) {
 
 struct App {
     output: term::PendingOutput,
+    downloads: downloads::Downloads,
     wheel_step: f64,
     chrome: Chrome,
     scale: f64,
@@ -385,6 +388,7 @@ fn browse(
 
     let mut app = App {
         output: Default::default(),
+        downloads: Default::default(),
         wheel_step: f64::from(wheel_step),
         chrome,
         scale: options.scale,
@@ -450,6 +454,7 @@ fn browse(
         Route::Layers => {}
         Route::Files => app.file_probe = graphics::ask_about_files(&mut app.page.files),
     }
+    app.downloads.start(&mut app.chrome);
     app.chrome.hold_acks();
     app.chrome.start_screencast();
     match options.url.as_deref().and_then(ui::normalize_url) {
@@ -520,6 +525,12 @@ fn browse(
             {
                 tab_input.push(message);
                 continue;
+            }
+            if let Msg::Term(event) = &message {
+                if app.download_input(event) {
+                    redraw = true;
+                    continue;
+                }
             }
             match &message {
                 Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
@@ -672,6 +683,13 @@ fn browse(
                     app.devtools.command(request, &mut app.chrome, page);
                 }
                 Msg::Chrome(message) => {
+                    if app.downloads.observe(&message) {
+                        if message["method"] == "Browser.downloadWillBegin" {
+                            app.note("Download started on server (↓)");
+                        }
+                        redraw = true;
+                        continue;
+                    }
                     if app.fit_request.is_some() && message["id"].as_u64() == app.fit_request {
                         app.fit_request = None;
                         app.fit(message["result"]["result"]["value"].as_f64());
@@ -986,6 +1004,7 @@ impl App {
             (Action::Back, "back (or the mouse's back button)"),
             (Action::Forward, "forward"),
             (Action::Reload, "reload"),
+            (Action::Downloads, "show server downloads (↓)"),
             (Action::Copy, "copy the selection, or the address"),
             (Action::ZoomIn, "zoom in"),
             (Action::ZoomOut, "zoom out"),
@@ -1227,6 +1246,10 @@ impl App {
             None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
+        if self.downloads.open {
+            self.help_rect = Some(self.downloads.draw(&mut out, self.window));
+            out.extend_from_slice(b"\x1b[?25l");
+        }
         out.extend_from_slice(b"\x1b[?2026l");
         out
     }
@@ -1327,6 +1350,7 @@ impl App {
                 self.find = None;
                 self.bar.focus();
             }
+            Action::Downloads => self.downloads.open = true,
             Action::Find => self.open_find(),
             Action::FindNext | Action::FindPrevious if self.find_text.is_empty() => return false,
             Action::FindNext => self.find_in_page(false, false),
@@ -1553,7 +1577,8 @@ impl App {
             if mouse.kind == MouseKind::Move {
                 let shape = match ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
                     Hit::Address(_) => "text",
-                    Hit::Back
+                    Hit::Downloads
+                    | Hit::Back
                     | Hit::Forward
                     | Hit::Reload
                     | Hit::NewTab
@@ -1587,6 +1612,7 @@ impl App {
                 return true;
             }
             match ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
+                Hit::Downloads => self.downloads.open = true,
                 Hit::Back => self.chrome.back(),
                 Hit::Forward => self.chrome.forward(),
                 Hit::Reload if self.loading => self.chrome.stop(),
