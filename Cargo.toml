@@ -21,6 +21,7 @@ miniz_oxide = "0.8"
 png = "0.18"
 serde_json = "1"
 tempfile = { version = "3", default-features = false }
+unicode-width = "0.2"
 zune-jpeg = "0.5"
 
 [profile.release]

@@ -289,6 +289,8 @@ struct App {
     /// Whether the bar is asking to quit, after a click on its close
     /// button, and whether it was answered yes.
     asking_quit: bool,
+    tab_strip: bool,
+    opening_tab: Option<(u64, Instant)>,
     quit_clicked: bool,
 }
 
@@ -429,6 +431,8 @@ fn browse(
         file_probe: None,
         panel: None,
         asking_quit: false,
+        tab_strip: false,
+        opening_tab: None,
         quit_clicked: false,
     };
     if let Some(dark) = options.dark {
@@ -475,18 +479,30 @@ fn browse(
 
     let mut wheel = crate::scroll::WheelScroll::default();
     let mut checked = Instant::now();
+    let mut tab_input = Vec::new();
     let result = loop {
-        let mut messages = Vec::new();
+        // A paste or key can arrive in the same PTY read as Ctrl+T. Hold
+        // it until Chrome has attached the requested tab so it cannot leak
+        // into the page the user just left.
+        if app.opening_tab.is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(5)) {
+            app.opening_tab = None;
+            tab_input.clear();
+            app.note("Chrome took too long to open the tab");
+            redraw = true;
+        }
+        let mut messages = if app.opening_tab.is_none() { std::mem::take(&mut tab_input) } else { Vec::new() };
         // Wake in time to let Chrome send its next frame.
         let wait = match app.chrome.ack_pending() {
             true => app.frame_gap().saturating_sub(app.last_ack.elapsed()).min(TICK),
             false => TICK,
         };
         let wait = wheel.wait(Instant::now()).map_or(wait, |remaining| remaining.min(wait));
-        match rx.recv_timeout(wait) {
-            Ok(message) => messages.push(message),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break Ok(()),
+        if messages.is_empty() {
+            match rx.recv_timeout(wait) {
+                Ok(message) => messages.push(message),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break Ok(()),
+            }
         }
         messages.extend(rx.try_iter());
 
@@ -499,6 +515,12 @@ fn browse(
         }
         let mut messages = messages.into_iter().enumerate().peekable();
         while let Some((index, message)) = messages.next() {
+            if (app.opening_tab.is_some() || !tab_input.is_empty())
+                && matches!(message, Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_)))
+            {
+                tab_input.push(message);
+                continue;
+            }
             match &message {
                 Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
                     for tick in wheel.report(*mouse, Instant::now()).into_iter().flatten() {
@@ -698,6 +720,22 @@ fn browse(
                             app.shown(url);
                             redraw = true;
                         }
+                        Some(PageEvent::TabsChanged) => redraw = true,
+                        Some(PageEvent::Created(id, url)) => {
+                            if app.opening_tab.is_some_and(|(pending, _)| pending == id) {
+                                app.opening_tab = None;
+                            }
+                            app.shown(url);
+                            redraw = true;
+                        }
+                        Some(PageEvent::CreateFailed(id, text)) => {
+                            if app.opening_tab.is_some_and(|(pending, _)| pending == id) {
+                                app.opening_tab = None;
+                                tab_input.clear();
+                            }
+                            app.note(&text);
+                            redraw = true;
+                        }
                         Some(PageEvent::Loading(loading)) => {
                             app.loading = loading;
                             redraw = true;
@@ -760,6 +798,13 @@ fn browse(
         }
         if let Some(tick) = wheel.due(Instant::now()) {
             redraw |= app.on_mouse(tick);
+        }
+        let strip = app.chrome.windows().1 > 1 && app.window.rows >= 3;
+        if strip != app.tab_strip {
+            app.tab_strip = strip;
+            app.layout();
+            app.clear();
+            new_frame = true;
         }
         // An encoded delta becomes part of the terminal's history. Only build
         // it when the previous write has finished. While busy, app.frame and
@@ -830,7 +875,7 @@ impl App {
     }
 
     fn page_rows(&self) -> u16 {
-        self.window.rows.saturating_sub(1).max(1)
+        self.window.rows.saturating_sub(1 + u16::from(self.tab_strip)).max(1)
     }
 
     /// Size the page's viewport to the cells below the top bar.
@@ -947,6 +992,8 @@ impl App {
             (Action::ZoomReset, "zoom to 100%, or out until the page fits"),
             (Action::Inspect, "inspect an element"),
             (Action::Devtools, "Chrome DevTools (start kb with --devtools)"),
+            (Action::NewTab, "open a new tab (+)"),
+            (Action::RestoreTab, "reopen the last closed tab (right-click +)"),
             (Action::NextWindow, "next window: a popup, a new tab (‹ › in the bar)"),
             (Action::PreviousWindow, "previous window"),
             (Action::CloseWindow, "close the window shown (✕); on the last one, ask to quit"),
@@ -1025,7 +1072,16 @@ impl App {
     /// its own events.
     fn shown(&mut self, url: String) {
         self.loading = false;
+        self.find = None;
+        self.buttons = 0;
+        self.last_press = None;
+        self.frame = None;
+        self.clear();
         self.went_to(url);
+        self.bar.blur(&self.url);
+        if self.url.is_empty() {
+            self.bar.focus();
+        }
     }
 
     /// Close the window shown, as a browser's tab closes; the last one is
@@ -1131,7 +1187,7 @@ impl App {
                 (false, false) => Route::Layers,
                 (false, true) => Route::Png,
             };
-            let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2);
+            let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2 + u16::from(self.tab_strip));
             if self.page.files_failed {
                 self.by_file = false;
                 self.png_only = true;
@@ -1159,6 +1215,10 @@ impl App {
         }
         let badge = badge.trim_end();
         let badge = (!badge.is_empty()).then_some(badge);
+        if self.tab_strip {
+            let (current, total) = self.chrome.windows();
+            ui::TabStrip::new(cols, current - 1, total).render(&mut out, current - 1, |at| self.chrome.tab_label(at));
+        }
         match &mut self.find {
             _ if self.asking_quit => ui::render_question(&mut out, ui::QUIT_QUESTION, cols),
             Some(field) => {
@@ -1220,7 +1280,18 @@ impl App {
             self.stop_inspecting();
             return false;
         }
-        match self.bindings.action(&key, focused || self.find.is_some()) {
+        let mut action = self.bindings.action(&key, focused || self.find.is_some());
+        // Ctrl+W edits a nonempty address. A freshly opened blank tab has
+        // nothing to delete, so the close binding should work immediately.
+        if action.is_none()
+            && focused
+            && self.find.is_none()
+            && self.bindings.action(&key, false) == Some(Action::CloseWindow)
+            && self.bar.text().is_empty()
+        {
+            action = Some(Action::CloseWindow);
+        }
+        match action {
             Some(Action::Quit) => return true,
             Some(action) if self.perform(action) => return false,
             _ => {}
@@ -1268,6 +1339,10 @@ impl App {
             Action::NextWindow => self.switch_window(1),
             Action::PreviousWindow => self.switch_window(-1),
             Action::CloseWindow => self.close_window(),
+            Action::NewTab | Action::RestoreTab => match self.chrome.new_tab(action == Action::RestoreTab) {
+                Ok(id) => self.opening_tab = Some((id, Instant::now())),
+                Err(message) => self.note(&message),
+            },
             Action::ZoomIn => self.step_zoom(true),
             Action::ZoomOut => self.step_zoom(false),
             Action::ZoomReset => self.zoom_to_fit(),
@@ -1478,12 +1553,25 @@ impl App {
             if mouse.kind == MouseKind::Move {
                 let shape = match ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
                     Hit::Address(_) => "text",
-                    Hit::Back | Hit::Forward | Hit::Reload | Hit::Close | Hit::PreviousWindow | Hit::NextWindow => {
-                        "pointer"
-                    }
+                    Hit::Back
+                    | Hit::Forward
+                    | Hit::Reload
+                    | Hit::NewTab
+                    | Hit::Close
+                    | Hit::PreviousWindow
+                    | Hit::NextWindow => "pointer",
                     Hit::Nothing => "default",
                 };
                 self.set_pointer(shape);
+            }
+            if ui::hit(col, self.window.cols as usize, self.chrome.windows()) == Hit::NewTab
+                && mouse.kind == MouseKind::Press
+            {
+                match mouse.button {
+                    Some(Button::Left) => return self.perform(Action::NewTab),
+                    Some(Button::Right) => return self.perform(Action::RestoreTab),
+                    _ => {}
+                }
             }
             if mouse.kind != MouseKind::Press || mouse.button != Some(Button::Left) {
                 return false;
@@ -1507,14 +1595,30 @@ impl App {
                 Hit::Address(_) => self.bar.focus(),
                 Hit::PreviousWindow => self.switch_window(-1),
                 Hit::NextWindow => self.switch_window(1),
-                Hit::Close | Hit::Nothing => {}
+                Hit::NewTab | Hit::Close | Hit::Nothing => {}
+            }
+            return true;
+        }
+
+        if self.tab_strip && py < 2.0 * cell_h && self.buttons == 0 {
+            let (current, total) = self.chrome.windows();
+            let strip = ui::TabStrip::new(self.window.cols as usize, current - 1, total);
+            let at = strip.at((px / cell_w) as usize);
+            if mouse.kind == MouseKind::Move {
+                self.set_pointer(if at.is_some() { "pointer" } else { "default" });
+            }
+            if mouse.kind == MouseKind::Press && mouse.button == Some(Button::Left) {
+                if let Some(PageEvent::Shown(url)) = at.and_then(|at| self.chrome.select(at)) {
+                    self.shown(url);
+                }
             }
             return true;
         }
 
         // The image covers `shown` cells and holds the whole viewport.
         let x = px / (self.shown.0 as f64 * cell_w) * self.viewport.0 as f64;
-        let y = (py - cell_h) / (self.shown.1 as f64 * cell_h) * self.viewport.1 as f64;
+        let y = (py - if self.tab_strip { 2.0 * cell_h } else { cell_h }) / (self.shown.1 as f64 * cell_h)
+            * self.viewport.1 as f64;
         let mut modifiers = 0;
         if mouse.alt {
             modifiers |= chrome::ALT;

@@ -66,17 +66,16 @@ Things it takes care of itself:
   scale factor is set at launch with `--force-device-scale-factor`; setting it
   only through `Emulation.setDeviceMetricsOverride` gives a blurry 1x image.
   So the scale is fixed per run. Resizing the viewport later needs no restart.
-- **New windows.** A window a page opens (a link to a new tab, a sign-in
-  popup) is attached to and shown in place of the page that opened it, which
-  waits, as a browser's tab would behind it; ‹ › in the bar switch between
-  them. Loading it in the one page
-  instead would break sign-in: the popup hands its result to the page that
-  opened it, through `window.opener`, and then closes. Each window gets the
-  same settings (the domains kb listens to, the user agent, the viewport,
-  the colour scheme) and its own headless window, fitted like the first.
-  Only the window shown sends events the app looks at. When it closes, by
-  itself, with ✕, or with Back on its first page, the one before it is
-  shown again.
+- **Tabs and popups.** Each tab has its own page target and CDP session
+  inside the same Chrome browser context. New tabs use `Target.createTarget`.
+  Chrome reports target discovery and the create reply independently. Once
+  both identify the same attached target, kb forwards input that arrived
+  while opening it. For links and popups, kb samples native visibility
+  before enabling focus emulation, so a background link leaves input on
+  the current page. A sign-in popup keeps its real `window.opener`.
+  The selected page owns the screencast. Browser-level target updates
+  keep the other tabs' titles and URLs current. Reopen loads the most
+  recently closed URL in this browser context; that URL lives in memory.
 - **Looking like a browser.** Sites such as Google answer what looks like a
   robot with captchas, and headless Chrome looks like one in four ways, each
   put right: `navigator.webdriver` is true (Chrome starts with

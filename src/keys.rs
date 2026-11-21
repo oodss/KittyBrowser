@@ -30,6 +30,8 @@ pub enum Action {
     Inspect,
     Devtools,
     Help,
+    NewTab,
+    RestoreTab,
     NextWindow,
     PreviousWindow,
     CloseWindow,
@@ -54,6 +56,8 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (Action::Inspect, "inspect", "inspect: hover to highlight elements, click one for its details"),
     (Action::Devtools, "devtools", "open Chrome DevTools for the page (needs kb --devtools)"),
     (Action::Help, "help", "show the help"),
+    (Action::NewTab, "new-tab", "open a new tab in this profile"),
+    (Action::RestoreTab, "restore-tab", "reopen the last closed tab"),
     (Action::NextWindow, "next-window", "show the next window a page opened (a popup, a new tab)"),
     (Action::PreviousWindow, "previous-window", "show the previous window"),
     (Action::CloseWindow, "close-window", "close the window shown; on the last one, ask to quit"),
@@ -100,7 +104,12 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("ctrl+pagedown", Action::NextWindow),
     ("ctrl+shift+tab", Action::PreviousWindow),
     ("ctrl+pageup", Action::PreviousWindow),
+    ("ctrl+t", Action::NewTab),
+    ("cmd+t", Action::NewTab),
+    ("ctrl+shift+t", Action::RestoreTab),
+    ("cmd+shift+t", Action::RestoreTab),
     ("ctrl+w", Action::CloseWindow),
+    ("cmd+w", Action::CloseWindow),
     ("ctrl+q", Action::Quit),
 ];
 
@@ -266,7 +275,7 @@ impl Bindings {
         // Later lines win, so the file overrides the defaults.
         let (spec, action) = self.list.iter().rev().find(|(spec, _)| spec.matches(key))?;
         // In a field, Ctrl+W deletes a word, as in a shell.
-        let field_key = spec.yields_to_fields() || *action == Action::CloseWindow;
+        let field_key = spec.yields_to_fields() || (*action == Action::CloseWindow && spec.ctrl);
         if *action == Action::None || (editing && field_key) {
             return None;
         }
@@ -364,6 +373,9 @@ mod tests {
     fn window_keys() {
         let bindings = Bindings::load(None);
         let ctrl = |code| Key { ctrl: true, ..key(code) };
+        let t = ctrl(KeyCode::Char('t'));
+        assert_eq!(bindings.action(&t, true), Some(Action::NewTab));
+        assert_eq!(bindings.action(&Key { shift: true, ..t }, false), Some(Action::RestoreTab));
         assert_eq!(bindings.action(&ctrl(KeyCode::Tab), false), Some(Action::NextWindow));
         assert_eq!(bindings.action(&ctrl(KeyCode::PageDown), false), Some(Action::NextWindow));
         assert_eq!(bindings.action(&ctrl(KeyCode::PageUp), false), Some(Action::PreviousWindow));
