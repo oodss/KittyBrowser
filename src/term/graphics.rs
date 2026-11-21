@@ -205,6 +205,10 @@ impl Tiles {
         self.overlaid.clear();
     }
 
+    pub fn refresh(&mut self) {
+        self.shown = None;
+    }
+
     /// Append the escapes that bring the screen to `new`, which must fit
     /// (see `fits`). `top` is the screen row of the page's first row.
     /// Returns what was sent, or `None` if a file couldn't be written, when
@@ -250,12 +254,12 @@ impl Tiles {
 
         let drawn = if old.is_none() || changed.len() * 3 > total as usize {
             // Too much for tiles to pay: the page again, and no tiles.
-            for id in self.overlaid.drain(..) {
-                out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
-            }
             let path = files.page_file(IMAGE_ID, &new.data).ok()?;
             out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
             put_raw_file(out, path, (new.width, new.height), new.alpha, IMAGE_ID, PAGE_Z, cols, rows);
+            for id in self.overlaid.drain(..) {
+                out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
+            }
             Drawn::Whole
         } else {
             for &(id, col, row, tile_cols, tile_rows) in &changed {
@@ -422,7 +426,8 @@ mod tests {
         // Everything changes: the page again, and the tile is removed.
         assert_eq!(tiles.draw(&mut out, &mut files, solid(60, 56, 9), cols, rows, cell, 2), Some(Drawn::Whole));
         let text = String::from_utf8(out).unwrap();
-        assert!(text.starts_with("\x1b_Ga=d,d=I,i=18,q=2\x1b\\\x1b[2;1H\x1b_Ga=T,"), "{text:?}");
+        assert!(text.starts_with("\x1b[2;1H\x1b_Ga=T,"), "{text:?}");
+        assert!(text.ends_with("\x1b_Ga=d,d=I,i=18,q=2\x1b\\"), "{text:?}");
     }
 
     #[test]

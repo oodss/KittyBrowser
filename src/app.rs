@@ -438,13 +438,13 @@ fn browse(
         app.note(&format!("~/.kittybrowser/keys {error}"));
     }
     app.layout();
-    // KB_TRANSFER=pty keeps frames on the pty, should files misbehave;
-    // KB_TRANSFER=png also sends them whole, for a terminal that can't
-    // place parts of images.
-    match std::env::var("KB_TRANSFER").as_deref() {
-        Ok("png") => app.png_only = true,
-        Ok("pty") => {}
-        _ => app.file_probe = graphics::ask_about_files(&mut app.page.files),
+    // Rex can read a server-side file even when the display is remote.
+    // Moving existing placements avoids repeatedly forwarding raw page pixels.
+    let rex = std::env::var_os("REX_SESSION").is_some() && std::env::var_os("REX_BLOCK").is_some();
+    match Route::preferred(std::env::var("KB_TRANSFER").ok().as_deref(), rex) {
+        Route::Png => app.png_only = true,
+        Route::Layers => {}
+        Route::Files => app.file_probe = graphics::ask_about_files(&mut app.page.files),
     }
     app.chrome.hold_acks();
     app.chrome.start_screencast();
@@ -609,7 +609,7 @@ fn browse(
                     if focused {
                         // A reattached client can have the same dimensions but
                         // no cached graphics. Repaint even if Chrome is idle.
-                        app.page.forget();
+                        app.page.refresh();
                         new_frame = true;
                     }
                     if focused != app.focused {
