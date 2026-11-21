@@ -37,6 +37,8 @@ pub enum Route {
     /// Through the pty, only what moved or changed. This needs placements
     /// with source rectangles, offsets within cells, z and `o=z`.
     Layers,
+    /// Moved layers with large payloads read locally by the Rex server.
+    LayerFiles,
     /// Through the pty, whole PNG frames only (`KB_TRANSFER=png`): for a
     /// terminal with no more of the kitty protocol than that.
     Png,
@@ -48,8 +50,16 @@ impl Route {
             Some("png") => Self::Png,
             Some("pty") => Self::Layers,
             Some("files") => Self::Files,
-            _ if rex => Self::Layers,
+            _ if rex => Self::LayerFiles,
             _ => Self::Files,
+        }
+    }
+
+    pub fn without_files(self) -> Self {
+        match self {
+            Self::Files => Self::Png,
+            Self::LayerFiles => Self::Layers,
+            route => route,
         }
     }
 }
@@ -168,11 +178,11 @@ impl PageImage {
             self.deferred = true;
             return "waiting for terminal to read the previous frame".to_owned();
         }
-        let route = if self.files_failed { Route::Png } else { route };
+        let route = if self.files_failed { route.without_files() } else { route };
         let start = out.len();
         let mut pixels = match route {
             Route::Files => crate::base64::decode(png).and_then(|bytes| graphics::decode_png(&bytes, Vec::new())),
-            Route::Layers | Route::Png => None,
+            Route::Layers | Route::LayerFiles | Route::Png => None,
         };
         // Only what changed, when the frame lines up with the cells: tiles
         // by file, or layers through the pty. Otherwise (a fixed viewport,
@@ -180,7 +190,7 @@ impl PageImage {
         let lined_up = !scaled && graphics::png_size(png).is_some_and(|size| graphics::fits(size, cols, rows, cell));
         let drawer = match &pixels {
             Some(_) if lined_up => Drawer::Tiles,
-            None if lined_up && route == Route::Layers => Drawer::Layers,
+            None if lined_up && matches!(route, Route::LayerFiles | Route::Layers) => Drawer::Layers,
             _ => Drawer::Whole,
         };
         self.hand_to(out, drawer);
@@ -192,7 +202,7 @@ impl PageImage {
                 .map(|sent| (sent == graphics::Drawn::Whole, format!("{sent:?}"))),
             Drawer::Layers => self
                 .layers
-                .draw(out, png, cols, rows, cell, top)
+                .draw(out, png, cols, rows, cell, top, (route == Route::LayerFiles).then_some(&mut self.files))
                 .map(|sent| (matches!(sent, super::layers::Sent::Whole(_)), format!("{sent:?}"))),
             Drawer::Whole => None,
         };
@@ -219,8 +229,11 @@ impl PageImage {
             }
             self.fallback();
         }
-        graphics::put_png(out, png, cols, rows);
-        "the whole frame, through the pty".to_owned()
+        if graphics::put_png(out, png, cols, rows, (route == Route::LayerFiles).then_some(&mut self.files)) {
+            "the whole PNG, by file".to_owned()
+        } else {
+            "the whole frame, through the pty".to_owned()
+        }
     }
 }
 
@@ -292,6 +305,58 @@ mod tests {
         assert_eq!(screen.page(2, CELL, 16, 40), page(16, 0).data);
         assert!(image.reply(graphics::IMAGE_ID, true));
         shows(&mut image, &mut screen, &page(16, 4), Route::Files);
+    }
+
+    #[test]
+    fn large_layer_files_preserve_pixels_and_recover_to_inline_layers() {
+        let (mut image, mut screen) = (PageImage::default(), Screen::default());
+        let mut pixels = frame(512, 192, |_, _| 0);
+        let mut seed = 17u32;
+        let mut fill = |bytes: &mut [u8]| {
+            for byte in bytes {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (seed >> 24) as u8;
+            }
+        };
+        fill(&mut pixels.data);
+        let draw = |image: &mut PageImage, pixels: &graphics::Pixels| {
+            let mut out = Vec::new();
+            image.draw(&mut out, &encode(pixels), Route::LayerFiles, false, 64, 12, (8, 16), 2);
+            out
+        };
+        for initial in [true, false] {
+            if !initial {
+                fill(&mut pixels.data[..512 * 3 * 40]);
+            }
+            let out = draw(&mut image, &pixels);
+            let commands = String::from_utf8_lossy(&out);
+            assert!(commands.contains(if initial { "f=100" } else { "o=z" }));
+            assert!(commands.contains("t=t,q=0"));
+            screen.feed(&out, (8, 16));
+            assert_eq!(screen.page(2, (8, 16), 512, 192), pixels.data);
+            let ids: Vec<_> = image.files.pending.iter().map(|(id, _)| *id).collect();
+            assert!(!ids.is_empty());
+            for id in ids {
+                assert!(!image.reply(id, true));
+            }
+        }
+        pixels.data[0] ^= 1;
+        let small = draw(&mut image, &pixels);
+        assert!(!String::from_utf8_lossy(&small).contains("t=t"));
+        screen.feed(&small, (8, 16));
+        image.refresh();
+        draw(&mut image, &pixels);
+        let (id, path) = &image.files.pending[0];
+        let path = path.to_path_buf();
+        assert!(image.reply(*id, false));
+        assert!(!path.exists());
+        screen.feed(&draw(&mut image, &pixels), (8, 16));
+        pixels.data[1] ^= 1;
+        let patch = draw(&mut image, &pixels);
+        assert!(String::from_utf8_lossy(&patch).contains("o=z"));
+        screen.feed(&patch, (8, 16));
+        assert!(image.files.pending.is_empty());
+        assert_eq!(screen.page(2, (8, 16), 512, 192), pixels.data);
     }
 
     #[test]
@@ -375,7 +440,7 @@ mod tests {
 
     #[test]
     fn refresh_places_the_complete_frame_before_retiring_old_images() {
-        for route in [Route::Files, Route::Layers, Route::Png] {
+        for route in [Route::Files, Route::Layers, Route::LayerFiles, Route::Png] {
             let (mut image, mut screen) = (PageImage::default(), Screen::default());
             shows(&mut image, &mut screen, &page(16, 0), route);
             shows(&mut image, &mut screen, &page(16, 5), route);
@@ -389,13 +454,25 @@ mod tests {
 
     #[test]
     fn explicit_transfer_choices_override_the_rex_default() {
-        assert_eq!(Route::preferred(None, true), Route::Layers);
+        assert_eq!(Route::preferred(None, true), Route::LayerFiles);
         assert_eq!(Route::preferred(None, false), Route::Files);
         for rex in [true, false] {
             for (setting, route) in [("files", Route::Files), ("pty", Route::Layers), ("png", Route::Png)] {
                 assert_eq!(Route::preferred(Some(setting), rex), route);
             }
         }
+    }
+
+    #[test]
+    fn scaled_rex_frames_keep_the_requested_display_size() {
+        let pixels = frame(320, 200, |x, y| x.wrapping_mul(y + 71) as u8);
+        let mut image = PageImage::default();
+        let mut out = Vec::new();
+        image.draw(&mut out, &encode(&pixels), Route::LayerFiles, true, 29, 12, (8, 16), 3);
+        let commands = String::from_utf8_lossy(&out);
+        assert!(commands.contains("c=29,r=12,t=t,q=0"));
+        let (_, path) = &image.files.pending[0];
+        assert_eq!(graphics::decode_png(&std::fs::read(path).unwrap(), Vec::new()).unwrap().data, pixels.data);
     }
 
     #[test]

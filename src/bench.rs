@@ -45,6 +45,7 @@ enum Transfer {
     /// Decoded here; what the terminal already has is moved where the
     /// page scrolled it, and only the rest sent through the pty.
     Layers,
+    LayerFiles,
 }
 
 struct Mode {
@@ -56,6 +57,7 @@ struct Mode {
 const MODES: &[Mode] = &[
     Mode { name: "png through the pty", source: Source::Png, transfer: Transfer::Pty },
     Mode { name: "png, moved layers through the pty", source: Source::Png, transfer: Transfer::Layers },
+    Mode { name: "png, moved layers with large files", source: Source::Png, transfer: Transfer::LayerFiles },
     Mode { name: "png, pixels by file", source: Source::Png, transfer: Transfer::File },
     Mode { name: "png, changed tiles by file", source: Source::Png, transfer: Transfer::Tiles },
     Mode { name: "jpeg 100, pixels by file", source: Source::Jpeg(100), transfer: Transfer::File },
@@ -309,13 +311,16 @@ fn run_modes(
 
             let mut out = b"\x1b[2;1H".to_vec();
             match mode.transfer {
-                Transfer::Pty => graphics::put_png(&mut out, &data, cols, rows),
-                Transfer::Layers => {
-                    if layers.draw(&mut out, &data, cols, rows, (cell_w, cell_h), 2).is_none() {
+                Transfer::Pty => {
+                    graphics::put_png(&mut out, &data, cols, rows, None);
+                }
+                Transfer::Layers | Transfer::LayerFiles => {
+                    let mut local = (mode.transfer == Transfer::LayerFiles).then_some(&mut files);
+                    if layers.draw(&mut out, &data, cols, rows, (cell_w, cell_h), 2, local.as_deref_mut()).is_none() {
                         // What the app would do: the frame as it came.
                         layers.forget();
                         out.extend_from_slice(graphics::DELETE);
-                        graphics::put_png(&mut out, &data, cols, rows);
+                        graphics::put_png(&mut out, &data, cols, rows, local);
                         odd.push(graphics::png_size(&data));
                     }
                 }

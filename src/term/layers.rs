@@ -27,7 +27,7 @@
 //! Images are placed at their own size, not scaled to cells, so this relies
 //! on `cell` being the terminal's cell to the pixel (`KB_TRANSFER=png` if not).
 
-use super::graphics::{crop, cut, decode_png, fits, png_size, transmit, Pixels};
+use super::graphics::{crop, cut, decode_png, fits, large_image_file, png_size, transmit, FrameFiles, Pixels};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -44,6 +44,7 @@ const MAX_PLACEMENTS: usize = 96;
 /// Changed rows this close together go in one strip: a strip's own cost
 /// (headers, an escape) is worth about this many unchanged rows.
 const GAP: u32 = 16;
+const DAMAGE_BAND: u32 = 96;
 /// Fewer than one in this many rows of columns changed, and nothing is
 /// taken to have moved.
 const STILL: usize = 32;
@@ -210,6 +211,7 @@ impl Layers {
     /// doesn't line up with the cells (see `graphics::fits`) or can't be
     /// decoded; the caller then draws it some other way, and calls `forget`
     /// once it has cleared the screen.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         out: &mut Vec<u8>,
@@ -218,12 +220,14 @@ impl Layers {
         rows: u16,
         cell: (u32, u32),
         top: u16,
+        mut files: Option<&mut FrameFiles>,
     ) -> Option<Sent> {
         // Decoding takes 10 ms or so: not for a frame that can't be used.
         if !png_size(png_base64).is_some_and(|size| fits(size, cols, rows, cell)) {
             return None;
         }
-        let new = decode_png(&crate::base64::decode(png_base64)?, std::mem::take(&mut self.spare))?;
+        let encoded = crate::base64::decode(png_base64)?;
+        let new = decode_png(&encoded, std::mem::take(&mut self.spare))?;
         let bytes = if new.alpha { 4 } else { 3 };
         let new = crop(new, cols as u32 * cell.0, rows as u32 * cell.1, bytes)?;
         let hashes = column_hashes(&new, cell.0);
@@ -241,7 +245,7 @@ impl Layers {
                     strips.extend(changed(&old.pixels, &new, region));
                 }
                 let strips = merge(strips);
-                match self.patch(out, &new, &regions, &strips, page) {
+                match self.patch(out, &new, &regions, &strips, page, files.as_deref_mut()) {
                     Err(why) => Sent::Whole(why),
                     Ok(()) => {
                         let shift = regions.iter().map(|r| r.shift).max_by_key(|s| s.abs()).unwrap_or(0);
@@ -251,7 +255,7 @@ impl Layers {
             }
         };
         if let Sent::Whole(_) = sent {
-            self.whole(out, png_base64, &new, page);
+            self.whole(out, png_base64, &encoded, &new, page, files);
         }
         self.shown = Some(Shown { pixels: new, hashes });
         if let Some(old) = old {
@@ -262,7 +266,15 @@ impl Layers {
 
     /// Replace everything with the frame Chrome sent, which may be a pixel
     /// or two larger than `new` (its cropped copy): only `new`'s part shows.
-    fn whole(&mut self, out: &mut Vec<u8>, png_base64: &str, new: &Pixels, page: Page) {
+    fn whole(
+        &mut self,
+        out: &mut Vec<u8>,
+        png_base64: &str,
+        encoded: &[u8],
+        new: &Pixels,
+        page: Page,
+        files: Option<&mut FrameFiles>,
+    ) {
         self.placements.clear();
         // Reserve a distinct ID while the old images are still held. A
         // remote display may process this large transfer over several reads.
@@ -270,10 +282,12 @@ impl Layers {
         let placement = self.new_placement(Rect { x: 0, y: 0, width: new.width, height: new.height }, &[]);
         page.cursor(out, &placement);
         let keys = format!(
-            "a=T,f=100,i={},p={},w={},h={},z={},C=1,q=2",
+            "a=T,f=100,i={},p={},w={},h={},z={},C=1",
             placement.image, placement.id, new.width, new.height, placement.z
         );
-        transmit(out, &keys, png_base64);
+        if !large_image_file(out, files, placement.image, &keys, encoded) {
+            transmit(out, &format!("{keys},q=2"), png_base64);
+        }
         for held in self.held.drain(..) {
             delete_image(out, held.id);
         }
@@ -293,6 +307,7 @@ impl Layers {
         regions: &[Region],
         strips: &[Rect],
         page: Page,
+        mut files: Option<&mut FrameFiles>,
     ) -> Result<(), Why> {
         let mut reused = Vec::new();
         let mut send = Vec::new();
@@ -361,7 +376,7 @@ impl Layers {
         for ((placement, data), pixels) in sent.into_iter().zip(compressed).zip(cuts) {
             page.cursor(out, placement);
             let keys = format!(
-                "a=T,f={},s={},v={},o=z,i={},p={},X={},Y={},z={},C=1,q=2",
+                "a=T,f={},s={},v={},o=z,i={},p={},X={},Y={},z={},C=1",
                 if new.alpha { 32 } else { 24 },
                 pixels.width,
                 pixels.height,
@@ -371,7 +386,9 @@ impl Layers {
                 placement.y % page.cell.1,
                 placement.z
             );
-            transmit(out, &keys, &crate::base64::encode(&data));
+            if !large_image_file(out, files.as_deref_mut(), placement.image, &keys, &data) {
+                transmit(out, &format!("{keys},q=2"), &crate::base64::encode(&data));
+            }
             self.held.push(Held { id: placement.image, x: placement.x, pixels, used: self.clock, rows: Vec::new() });
         }
         // Retire old placements only after their replacement pixels arrive.
@@ -761,8 +778,12 @@ fn find_regions(old: &[u64], new: &[u64], height: usize, column: u32, width: u32
         // the same strip as the next column's, so cost little more.
         let unmatched = |shift: i64| {
             let exposed = shift.unsigned_abs().min(height as u64) as usize;
-            let rows = (0..height).filter(|&y| (0..height as i64).contains(&(y as i64 + shift)));
-            rows.filter(|&y| old[(y as i64 + shift) as usize] != new[y]).count() + exposed / 8
+            let (old, new) = if shift >= 0 {
+                (&old[exposed..], &new[..height - exposed])
+            } else {
+                (&old[..height - exposed], &new[exposed..])
+            };
+            old.iter().zip(new).filter(|(a, b)| a != b).count() + exposed / 8
         };
         // Ties go to the column to the left, so regions stay whole.
         let previous = regions.last().map(|r| r.shift);
@@ -784,13 +805,42 @@ fn find_regions(old: &[u64], new: &[u64], height: usize, column: u32, width: u32
 /// region says, top to bottom. Rows with nothing in `old` to come from
 /// differ.
 fn changed(old: &Pixels, new: &Pixels, region: &Region) -> Vec<Rect> {
+    let mut strips = Vec::new();
+    for rect in changed_rows(old, new, region, 0..new.height) {
+        // Animations at opposite ends of the same rows can enclose a large
+        // unchanged centre. Refine only expensive strips with bounded effort.
+        let pixels = u64::from(rect.width) * u64::from(rect.height);
+        if rect.width <= DAMAGE_BAND || pixels < 32 * 1024 || strips.len() >= MAX_PLACEMENTS {
+            strips.push(rect);
+            continue;
+        }
+        let start = strips.len();
+        for x in (rect.x..rect.x + rect.width).step_by(DAMAGE_BAND as usize) {
+            let band = Region { x: x..(x + DAMAGE_BAND).min(rect.x + rect.width), shift: region.shift };
+            strips.extend(changed_rows(old, new, &band, rect.y..rect.y + rect.height));
+            if strips.len() > MAX_PLACEMENTS {
+                break;
+            }
+        }
+        let refined = &strips[start..];
+        if strips.len() > MAX_PLACEMENTS
+            || area(refined) + STRIP_COST * refined.len().saturating_sub(1) as u64 >= pixels
+        {
+            strips.truncate(start);
+            strips.push(rect);
+        }
+    }
+    strips
+}
+
+fn changed_rows(old: &Pixels, new: &Pixels, region: &Region, rows: std::ops::Range<u32>) -> Vec<Rect> {
     let bytes = if new.alpha { 4 } else { 3 };
     let stride = new.width as usize * bytes;
     let (left, right) = (region.x.start as usize * bytes, region.x.end as usize * bytes);
     let mut strips: Vec<Rect> = Vec::new();
     // The strip being grown: first row, last row, and the columns it spans.
     let mut open: Option<(u32, u32, u32, u32)> = None;
-    for y in 0..new.height {
+    for y in rows {
         let row = &new.data[y as usize * stride..][left..right];
         let from = y as i64 + region.shift;
         let span = if (0..old.height as i64).contains(&from) {
@@ -953,6 +1003,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn distant_animations_do_not_resend_the_picture_between_them() {
+        let old = frame(512, 128, |x, y| (x ^ y) as u8);
+        let new = frame(512, 128, |x, y| {
+            let changed = !(16..496).contains(&x);
+            (x ^ y) as u8 ^ u8::from(changed)
+        });
+        let strips = merge(changed(&old, &new, &Region { x: 0..512, shift: 0 }));
+        assert_eq!(strips.len(), 2);
+        assert_eq!(area(&strips), 32 * 128);
+    }
+
+    #[test]
     fn sends_one_changed_pixel() {
         let (old, mut new) = (page(10), page(10));
         new.data[20 * 24 + 3 * 3 + 2] ^= 1;
@@ -987,7 +1049,7 @@ pub(crate) mod tests {
         let (cols, rows, cell) = (2, 10, (4, 4));
         let mut layers = Layers::default();
         let mut out = Vec::new();
-        assert_eq!(layers.draw(&mut out, &encode(&page(10)), cols, rows, cell, 2), Some(Sent::Whole(Why::First)));
+        assert_eq!(layers.draw(&mut out, &encode(&page(10)), cols, rows, cell, 2, None), Some(Sent::Whole(Why::First)));
         let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
         assert!(
             text.starts_with("\x1b[2;1H\x1b_Ga=T,f=100,i=1000,p=1,w=8,h=40,z=-1999999999,C=1,q=2,m=0;"),
@@ -998,7 +1060,7 @@ pub(crate) mod tests {
         // last 6 rows come in from row 34, which is row 8 of the cells and 2
         // pixels down.
         assert_eq!(
-            layers.draw(&mut out, &encode(&page(16)), cols, rows, cell, 2),
+            layers.draw(&mut out, &encode(&page(16)), cols, rows, cell, 2, None),
             Some(Sent::Strips { shift: 6, strips: 1 })
         );
         let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
@@ -1014,7 +1076,7 @@ pub(crate) mod tests {
         // Back up 3: the first image moves down 3, the strip too, losing
         // its last 3 rows off the bottom, and the top 3 rows are sent.
         assert_eq!(
-            layers.draw(&mut out, &encode(&page(13)), cols, rows, cell, 2),
+            layers.draw(&mut out, &encode(&page(13)), cols, rows, cell, 2, None),
             Some(Sent::Strips { shift: -3, strips: 1 })
         );
         let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
@@ -1024,7 +1086,7 @@ pub(crate) mod tests {
 
         // Nothing changes: nothing is sent.
         assert_eq!(
-            layers.draw(&mut out, &encode(&page(13)), cols, rows, cell, 2),
+            layers.draw(&mut out, &encode(&page(13)), cols, rows, cell, 2, None),
             Some(Sent::Strips { shift: 0, strips: 0 })
         );
         assert!(out.is_empty());
@@ -1178,7 +1240,7 @@ pub(crate) mod tests {
             scrolled = (scrolled as i64 + step) as u32;
             let new = frame(scrolled, caret);
             let mut out = Vec::new();
-            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2).unwrap();
+            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2, None).unwrap();
             screen.feed(&out, cell);
             assert!(screen.page(2, cell, width, height) == new.data, "scrolled to {scrolled} and sent {sent:?}");
             if n == 4 {
@@ -1222,7 +1284,7 @@ pub(crate) mod tests {
         for (n, scrolled) in [0, 0, 3, 6, 9, 12, 15, 18].into_iter().enumerate() {
             let new = frame(scrolled, n % 2 == 1);
             let mut out = Vec::new();
-            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2).unwrap();
+            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2, None).unwrap();
             screen.feed(&out, cell);
             assert!(screen.page(2, cell, width, height) == new.data, "step {n}: sent {sent:?}");
             nothing_left_behind(&layers, &screen);
@@ -1240,12 +1302,12 @@ pub(crate) mod tests {
         let mut layers = Layers::default();
         let mut screen = Screen::default();
         let mut out = Vec::new();
-        layers.draw(&mut out, &encode(&page(10)), cols, rows, cell, 2).unwrap();
+        layers.draw(&mut out, &encode(&page(10)), cols, rows, cell, 2, None).unwrap();
         let mut new = page(10);
         new.data[8 * 24..16 * 24].fill(9);
         let strips = [Rect { x: 0, y: 9, width: 8, height: 1 }, Rect { x: 0, y: 8, width: 8, height: 8 }];
         let page = Page { top: 2, cell, height: 40 };
-        assert_eq!(layers.patch(&mut out, &new, &whole_page(0), &strips, page), Ok(()));
+        assert_eq!(layers.patch(&mut out, &new, &whole_page(0), &strips, page, None), Ok(()));
         screen.feed(&out, cell);
         assert!(screen.page(2, cell, 8, 40) == new.data);
         nothing_left_behind(&layers, &screen);
@@ -1274,7 +1336,7 @@ pub(crate) mod tests {
                 _ => ((y as i64 + scrolled) * 13 % 256 + x as i64 * 3) as u8,
             });
             let mut out = Vec::new();
-            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2).unwrap();
+            let sent = layers.draw(&mut out, &encode(&new), cols, rows, cell, 2, None).unwrap();
             screen.feed(&out, cell);
             assert!(screen.page(2, cell, width, height) == new.data, "step {step}: sent {sent:?}");
             nothing_left_behind(&layers, &screen);

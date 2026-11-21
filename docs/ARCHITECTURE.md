@@ -124,9 +124,8 @@ There are two ways to send a frame:
   "Over a network" below); the base64 PNG as Chrome sent it (`f=100`) is
   the fallback when a frame can't be drawn that way.
 
-What Rex accepts, found by querying it: raw pixels directly, raw pixels with
-zlib, and raw pixels from a file in a temporary directory. It refuses PNG
-from a file, files outside temporary directories, and shared memory.
+The tested Rex server accepts raw pixels, zlib-compressed strips and PNGs
+from private temporary files. kb probes file support in each new pane.
 
 Measured with `kb bench` in Rex on a 1372x1624 pixel pane, scrolling a
 Wikipedia article, median milliseconds per step:
@@ -161,12 +160,17 @@ on partial updates, kb sends a fresh base once, including for a page that
 has since stopped changing. This repairs a client that lost placements
 after its server acknowledged them.
 
-**Over a network** (`term::layers`). Rex uses layers by default because its
-server can read temporary files even when the display is on another machine.
-A refresh transfers the new base before retiring the previous images so a
-slow transfer can keep showing the old frame. `KB_TRANSFER=files` opts into
-the file probe. With layers, every transmitted byte travels through the
-pty, including over SSH. A whole
+**Over a network** (`term::layers`). Rex keeps the page as movable layers.
+Small updates travel through the PTY. Once Rex confirms it can read a
+temporary file, kb passes PNGs and compressed strips of at least 32 KiB
+by file, with the same placement and encoding. Files stay in kb's private
+directory until acknowledged. A rejected transfer or a missing reply
+rebuilds the page using inline layers. `KB_TRANSFER=pty` forces inline
+layers and `KB_TRANSFER=files` selects the raw file tiles described above.
+The file is local to the server running kb and Rex. The desktop still
+receives the image through Rex's own transport.
+
+A refresh transfers the new base before retiring the previous images. A whole
 2736x1666 frame is about 1.1 MB, and resending it for each scroll step or
 keystroke cost 50 to 70 ms on a LAN. So each frame is decoded and compared
 with the one on screen:
@@ -180,6 +184,9 @@ with the one on screen:
 - **What changed.** Whatever still differs (a caret, a typed word, a sticky
   header) is sent as small rectangles of raw pixels compressed with zlib
   (`f=24,o=z`, level 3, on a few threads), laid on top with a higher z.
+  Large changed rectangles are checked in 96-pixel bands to avoid sending
+  the static pixels between separate animations. kb keeps the coarse strip
+  when the smaller rectangles would cost more or fragment too far.
 - **What came back.** Images that scroll off are kept for a while, two pages'
   worth, and kb keeps their rows' hashes; scrolling back places them again
   instead of sending them.
