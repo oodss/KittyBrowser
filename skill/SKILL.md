@@ -187,8 +187,8 @@ k check --ignore optimizely.com,doubleclick.net  # third-party noise doesn't cou
 - `click --double` double-clicks; `click SELECTOR --at X,Y` clicks a point
   in an element (a canvas, a map). If the mouse click doesn't reach the
   page, `click` clicks by script instead and says so.
-- `alert`, `confirm` and `prompt` are accepted and reported by the command
-  that caused them; `dialog dismiss` or `dialog accept --text TEXT` changes
+- `alert`, `confirm` and `prompt` wait for the user in an interactive pane. Headless
+  sessions accept by default; `dialog dismiss` or `dialog accept --text TEXT` changes
   that for later ones.
 - `eval` reads what no command does (an order, a count, one value).
 

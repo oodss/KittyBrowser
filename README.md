@@ -188,6 +188,8 @@ click the address to edit it, and click, drag and scroll the page.
 | Ctrl+W | Close the window shown (✕); on the last one, ask to quit |
 | Ctrl+Q | Quit (the ✕ at the right of the bar closes a popup, or asks first) |
 
+Site dialogs show their origin and message in the pane. Enter accepts and Esc cancels. Type into the Prompt field when a site asks for text. Headless sessions and explicit `kb ctl dialog` policies keep automatic replies.
+
 Every other key goes to the page. The mouse's back and forward buttons go
 back and forward. `kb keys` lists the bindings; change them in
 `~/.kittybrowser/keys`, one per line (`ctrl+shift+i devtools`, or

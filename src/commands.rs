@@ -213,7 +213,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "dialog",
-        help: "Choose how alert, confirm and prompt dialogs are answered from now on. They are answered at once, since an open dialog freezes the page: by default accepted, with a prompt's default text. Each one is recorded in console and reported by the command that caused it.",
+        help: "Choose how alert, confirm and prompt dialogs are answered from now on. An interactive pane waits for your answer unless this command selects automatic replies. Headless sessions accept by default, using the prompt default. Each one is recorded in console and reported by the command that caused it.",
         params: &[
             required("answer", "accept or dismiss"),
             option("text", "TEXT", "what to type into prompts when accepting (default: the prompt's own default)"),

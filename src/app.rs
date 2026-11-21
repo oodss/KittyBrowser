@@ -3,6 +3,8 @@
 //! Loop: wait for input or a message from the engine; update state; draw
 //! only what changed. Row 1 is the top bar, the page image fills the rest.
 
+mod dialog;
+
 use crate::control::{self, Output, Request};
 use crate::devtools::{Devtools, Page};
 use crate::engine::chrome::{self, Chrome, PageEvent};
@@ -288,6 +290,7 @@ struct App {
     panel: Option<Vec<String>>,
     /// Whether the bar is asking to quit, after a click on its close
     /// button, and whether it was answered yes.
+    dialogs: dialog::Dialogs,
     asking_quit: bool,
     tab_strip: bool,
     opening_tab: Option<(u64, Instant)>,
@@ -430,6 +433,7 @@ fn browse(
         copy_request: CopyRequest::default(),
         file_probe: None,
         panel: None,
+        dialogs: Default::default(),
         asking_quit: false,
         tab_strip: false,
         opening_tab: None,
@@ -520,6 +524,12 @@ fn browse(
             {
                 tab_input.push(message);
                 continue;
+            }
+            if let Msg::Term(event) = &message {
+                if app.dialog_input(event) {
+                    redraw = true;
+                    continue;
+                }
             }
             match &message {
                 Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
@@ -683,6 +693,10 @@ fn browse(
                             redraw = true;
                             continue;
                         }
+                    }
+                    if app.dialog_event(&message) {
+                        redraw = true;
+                        continue;
                     }
                     if !app.chrome.shown(&message) {
                         continue;
@@ -1059,6 +1073,9 @@ impl App {
         if let Some(old) = self.help_rect.take() {
             ui::blank(out, old);
         }
+        if self.draw_dialog(out) {
+            return;
+        }
         if !self.help {
             return;
         }
@@ -1168,7 +1185,8 @@ impl App {
     }
 
     fn navigate(&mut self, url: &str) {
-        self.url = url.to_owned();
+        // Keep the committed URL until Chrome confirms the navigation. A site
+        // can still cancel it after the field shows the requested destination.
         self.loading = true;
         self.bar.blur(url);
         self.chrome.navigate(url);
