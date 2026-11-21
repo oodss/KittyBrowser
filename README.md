@@ -3,13 +3,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/graiz/kittybrowser/actions/workflows/ci.yml"><img src="https://github.com/graiz/kittybrowser/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/oodss/KittyBrowser/actions/workflows/ci.yml"><img src="https://github.com/oodss/KittyBrowser/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="macOS and Linux">
   <img src="https://img.shields.io/badge/written%20in-Rust-orange" alt="Written in Rust">
 </p>
 
 # KittyBrowser (`kb`)
+
+This fork of [graiz/KittyBrowser](https://github.com/graiz/KittyBrowser) includes privacy fixes for remote terminal sessions.
 
 A real web browser in a terminal pane. kb drives headless Chrome and draws
 each page as pixels with the
@@ -42,7 +44,7 @@ you, a star helps other people find it.
 With [Rust](https://rustup.rs) and Chrome installed:
 
 ```sh
-cargo install --git https://github.com/graiz/kittybrowser
+cargo install --locked --git https://github.com/oodss/KittyBrowser
 kb doctor                  # checks your terminal and Chrome, and says what to fix
 kb news.ycombinator.com
 ```
@@ -55,7 +57,7 @@ There is no prebuilt release yet, so kb needs Rust to build. Once releases
 are published, this will install kb without Rust:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/graiz/kittybrowser/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oodss/KittyBrowser/main/install.sh | sh
 ```
 
 It puts a prebuilt kb in `~/.local/bin` (`KB_INSTALL_DIR` to put it
@@ -84,7 +86,7 @@ blank pane; `KB_FORCE=1` skips the question.
 
 ```sh
 brew install --cask google-chrome                     # if you don't have Chrome
-cargo install --git https://github.com/graiz/kittybrowser   # puts kb in ~/.cargo/bin
+cargo install --locked --git https://github.com/oodss/KittyBrowser   # puts kb in ~/.cargo/bin
 kb https://example.com
 ```
 
@@ -95,7 +97,7 @@ On a non-retina display, start it with `kb --scale 1`.
 Install Chrome or Chromium from your distribution or google.com/chrome, then:
 
 ```sh
-cargo install --git https://github.com/graiz/kittybrowser
+cargo install --locked --git https://github.com/oodss/KittyBrowser
 kb --scale 2 https://example.com    # --scale 2 on a HiDPI screen; the default is 1
 ```
 
@@ -107,7 +109,7 @@ untested, so please open an issue with what you find.
 ### From a clone
 
 ```sh
-git clone https://github.com/graiz/kittybrowser
+git clone https://github.com/oodss/KittyBrowser
 cd kittybrowser
 cargo install --path .
 ```
@@ -185,8 +187,8 @@ change at once.
   Chrome won't share a profile, so the second and later ones have their own
   cookies (`profile-2`, ...); history is shared.
 - **Copying** goes through the terminal (OSC 52), so it reaches your
-  clipboard even over SSH. It catches what pages copy themselves, such as a
-  code block's copy button.
+  clipboard even over SSH. Use the copy shortcut with a selection or the address field.
+  Website copy buttons operate inside Chrome.
 - **Colours:** the bar takes the terminal's colours, and pages are told you
   prefer dark mode when the terminal's background is dark. `--dark` or
   `--light` overrides that.

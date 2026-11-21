@@ -98,20 +98,33 @@ pub fn decode_jpeg(bytes: &[u8]) -> Option<Pixels> {
     })
 }
 
-/// Where to put frame number `seq` for the terminal to read. The protocol
-/// wants a temporary directory and this phrase in the name before it will
-/// read, then delete, a file.
-pub fn temp_path(seq: u64) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("tty-graphics-protocol-kb-{}-{seq}", std::process::id()))
+/// The terminal may unlink a frame after reading it. The private directory
+/// keeps frames inaccessible to other users and cleans up any left on exit.
+#[derive(Default)]
+pub struct FrameFiles {
+    directory: Option<tempfile::TempDir>,
 }
 
-/// A `temp_path` no other frame or tile has used.
-pub fn next_path() -> std::path::PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    temp_path(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+impl FrameFiles {
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        if self.directory.is_none() {
+            self.directory = Some(
+                tempfile::Builder::new()
+                    .prefix("kb-frames-")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir()?,
+            );
+        }
+        let directory = self.directory.as_ref().expect("initialized above");
+        let mut file = tempfile::Builder::new().prefix("tty-graphics-protocol-kb-").tempfile_in(directory.path())?;
+        file.write_all(bytes)?;
+        Ok(file.into_temp_path().keep()?)
+    }
 }
 
-/// Append the escape that draws the pixels saved at `path` (see `temp_path`)
+/// Append the escape that draws the pixels saved at `path` in the private directory
 /// at the cursor, scaled to fill `cols` x `rows` cells. The terminal reads
 /// the file itself and deletes it, so nothing but its name crosses the pty.
 pub fn put_file(out: &mut Vec<u8>, path: &std::path::Path, pixels: &Pixels, cols: u16, rows: u16) {
@@ -190,9 +203,11 @@ impl Tiles {
     /// (see `fits`). `top` is the screen row of the page's first row.
     /// Returns what was sent, or `None` if a file couldn't be written, when
     /// the screen is in no known state.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         out: &mut Vec<u8>,
+        files: &mut FrameFiles,
         new: Pixels,
         cols: u16,
         rows: u16,
@@ -235,8 +250,7 @@ impl Tiles {
             for id in self.overlaid.drain(..) {
                 out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
             }
-            let path = next_path();
-            std::fs::write(&path, &new.data).ok()?;
+            let path = files.write(&new.data).ok()?;
             out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
             put_raw_file(out, &path, (new.width, new.height), new.alpha, IMAGE_ID, PAGE_Z, cols, rows);
             self.last.push(path);
@@ -245,8 +259,7 @@ impl Tiles {
             for &(id, col, row, tile_cols, tile_rows) in &changed {
                 let (x, y) = (col as u32 * cell.0, row as u32 * cell.1);
                 let tile = cut(&new, x, y, tile_cols as u32 * cell.0, tile_rows as u32 * cell.1);
-                let path = next_path();
-                std::fs::write(&path, &tile.data).ok()?;
+                let path = files.write(&tile.data).ok()?;
                 out.extend_from_slice(format!("\x1b[{};{}H", top + row, col + 1).as_bytes());
                 let size = (tile.width, tile.height);
                 put_raw_file(out, &path, size, new.alpha, id, TILE_Z, tile_cols, tile_rows);
@@ -301,12 +314,11 @@ pub const FILE_QUERY_ID: u32 = 2;
 /// which is far quicker than sending them through the pty. The answer
 /// arrives as an `input::Event::Graphics` with `FILE_QUERY_ID`. A terminal
 /// on another machine can't see our files and says no.
-pub fn ask_about_files() {
-    let path = temp_path(0);
-    if std::fs::write(&path, [0, 0, 0]).is_ok() {
-        let name = crate::base64::encode(path.as_os_str().as_encoded_bytes());
-        super::write(format!("\x1b_Ga=q,i={FILE_QUERY_ID},f=24,s=1,v=1,t=t;{name}\x1b\\").as_bytes());
-    }
+pub fn ask_about_files(files: &mut FrameFiles) -> Option<std::path::PathBuf> {
+    let path = files.write(&[0, 0, 0]).ok()?;
+    let name = crate::base64::encode(path.as_os_str().as_encoded_bytes());
+    super::write(format!("\x1b_Ga=q,i={FILE_QUERY_ID},f=24,s=1,v=1,t=t;{name}\x1b\\").as_bytes());
+    Some(path)
 }
 
 /// Width and height of a base64 PNG, read from its header. For diagnostics.
@@ -320,6 +332,20 @@ pub fn png_size(png_base64: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frames_are_private_and_removed_with_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut files = FrameFiles::default();
+        let first = files.write(b"first").unwrap();
+        let second = files.write(b"second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(first.parent().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        drop(files);
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
 
     #[test]
     fn decodes_png_and_jpeg() {
@@ -370,29 +396,30 @@ mod tests {
     fn tiles_send_only_what_changed() {
         // 30x14 cells of 2x4 pixels: 3 tiles across, 3 down.
         let (cols, rows, cell) = (30, 14, (2, 4));
+        let mut files = FrameFiles::default();
         let mut tiles = Tiles::default();
         let mut out = Vec::new();
         assert!(fits((60, 56), cols, rows, cell));
         assert!(fits((61, 57), cols, rows, cell));
         assert!(!fits((59, 56), cols, rows, cell));
         // The first frame goes whole, a pixel too wide and cropped.
-        assert_eq!(tiles.draw(&mut out, solid(61, 56, 0), cols, rows, cell, 2), Some(Drawn::Whole));
+        assert_eq!(tiles.draw(&mut out, &mut files, solid(61, 56, 0), cols, rows, cell, 2), Some(Drawn::Whole));
         let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
         assert!(text.starts_with("\x1b[2;1H\x1b_Ga=T,f=24,s=60,v=56,t=t,i=1,p=1,z=-1073741826,"), "{text:?}");
-        assert_eq!(tiles.draw(&mut out, solid(60, 56, 0), cols, rows, cell, 2), Some(Drawn::Tiles(0)));
+        assert_eq!(tiles.draw(&mut out, &mut files, solid(60, 56, 0), cols, rows, cell, 2), Some(Drawn::Tiles(0)));
         assert!(out.is_empty());
 
         // One pixel in the last cell: only the bottom right tile goes.
         let mut changed = solid(60, 56, 0);
         *changed.data.last_mut().unwrap() = 1;
-        assert_eq!(tiles.draw(&mut out, changed, cols, rows, cell, 2), Some(Drawn::Tiles(1)));
+        assert_eq!(tiles.draw(&mut out, &mut files, changed, cols, rows, cell, 2), Some(Drawn::Tiles(1)));
         let text = String::from_utf8(std::mem::take(&mut out)).unwrap();
         // Tile 9 of 9, at column 25 and row 2 + 12, 6 cells by 2, on top.
         assert!(text.starts_with("\x1b[14;25H\x1b_Ga=T,f=24,s=12,v=8,t=t,i=18,p=1,z=-1073741825,"), "{text:?}");
         assert!(text.contains(",c=6,r=2;"), "{text:?}");
 
         // Everything changes: the page again, and the tile is removed.
-        assert_eq!(tiles.draw(&mut out, solid(60, 56, 9), cols, rows, cell, 2), Some(Drawn::Whole));
+        assert_eq!(tiles.draw(&mut out, &mut files, solid(60, 56, 9), cols, rows, cell, 2), Some(Drawn::Whole));
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("\x1b_Ga=d,d=I,i=18,q=2\x1b\\\x1b[2;1H\x1b_Ga=T,"), "{text:?}");
         for path in tiles.last.drain(..) {

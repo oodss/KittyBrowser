@@ -3,7 +3,7 @@ name = "kittybrowser"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/graiz/kittybrowser"
+repository = "https://github.com/oodss/KittyBrowser"
 readme = "README.md"
 keywords = ["browser", "terminal", "kitty", "chrome", "agents"]
 categories = ["command-line-utilities", "web-programming"]
@@ -19,6 +19,7 @@ libc = "0.2"
 miniz_oxide = "0.8"
 png = "0.18"
 serde_json = "1"
+tempfile = { version = "3", default-features = false }
 zune-jpeg = "0.5"
 
 [profile.release]

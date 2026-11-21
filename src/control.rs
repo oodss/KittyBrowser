@@ -97,7 +97,8 @@ pub fn claim() -> Result<Claim, String> {
         // Left behind by a kb that didn't exit cleanly.
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket).map_err(|e| format!("listening on {}: {e}", socket.display()))?;
-        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("securing {}: {e}", socket.display()))?;
         // Read back by status, from this process only.
         std::env::set_var("KB_ID", new_id(instance));
         return Ok(Claim { instance, socket, listener });

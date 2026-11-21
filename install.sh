@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install kb: downloads the latest release for this machine.
 #
-#   curl -fsSL https://raw.githubusercontent.com/graiz/kittybrowser/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/oodss/KittyBrowser/main/install.sh | sh
 #
 # KB_INSTALL_DIR picks where kb goes (default ~/.local/bin). When there is no
 # release for this machine, it builds from source with cargo instead.
@@ -60,7 +60,7 @@ download() {
 }
 
 main() {
-  repo="${KB_REPO:-graiz/kittybrowser}"
+  repo="${KB_REPO:-oodss/KittyBrowser}"
   dir="${KB_INSTALL_DIR:-$HOME/.local/bin}"
 
   case "$(uname -s)" in

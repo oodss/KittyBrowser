@@ -121,6 +121,34 @@ const HOVER: &str = "((x, y) => { let e = document.elementFromPoint(x, y); \
 /// Take inspect mode's outline off the page.
 const UNHOVER: &str = "document.getElementById('__kb_inspect')?.remove(); delete globalThis.__kbInspected;";
 
+// Read the selection only for a copy shortcut received from the terminal.
+// A page must never have a standing callback into the client clipboard.
+#[derive(Default)]
+struct CopyRequest {
+    world: Option<u64>,
+    selection: Option<u64>,
+}
+
+impl CopyRequest {
+    // Only replies to the outstanding physical shortcut may reach OSC 52.
+    // Each reply is consumed once, including Chrome errors.
+    fn consume(pending: &mut Option<u64>, id: u64) -> bool {
+        if *pending == Some(id) {
+            *pending = None;
+            return true;
+        }
+        false
+    }
+}
+
+const SELECTION: &str = r#"(() => {
+  const el = document.activeElement;
+  if (el && typeof el.selectionStart === 'number' && el.type !== 'password') {
+    return el.value.slice(el.selectionStart, el.selectionEnd);
+  }
+  return String(window.getSelection() ?? '');
+})()"#;
+
 /// Describe the element inspected, as lines for a box: what it is, a
 /// selector for it, its box and its main styles.
 const DESCRIBE: &str = "(function() { const el = this, s = getComputedStyle(el), r = el.getBoundingClientRect(), n = Math.round; \
@@ -139,7 +167,7 @@ const DESCRIBE: &str = "(function() { const el = this, s = getComputedStyle(el),
     'color     ' + s.color + ' on ' + s.backgroundColor, \
     'margin    ' + s.margin, 'padding   ' + s.padding]; \
   if (text) lines.push('text      ' + (text.length > 60 ? text.slice(0, 60) + '…' : text)); \
-  return {lines, selector: path.join(' > ')}; }).call(globalThis.__kbInspected)";
+  return {lines}; }).call(globalThis.__kbInspected)";
 
 enum Msg {
     Term(Event),
@@ -255,6 +283,8 @@ struct App {
     /// picked.
     inspecting: bool,
     describe_request: Option<u64>,
+    copy_request: CopyRequest,
+    file_probe: Option<std::path::PathBuf>,
     /// Lines for the box, in place of the help: an element's details.
     panel: Option<Vec<String>>,
     /// Whether the bar is asking to quit, after a click on its close
@@ -387,6 +417,8 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         dark: options.dark,
         inspecting: false,
         describe_request: None,
+        copy_request: CopyRequest::default(),
+        file_probe: None,
         panel: None,
         asking_quit: false,
         quit_clicked: false,
@@ -404,7 +436,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
     match std::env::var("KB_TRANSFER").as_deref() {
         Ok("png") => app.png_only = true,
         Ok("pty") => {}
-        _ => graphics::ask_about_files(),
+        _ => app.file_probe = graphics::ask_about_files(&mut app.page.files),
     }
     app.chrome.hold_acks();
     app.chrome.start_screencast();
@@ -521,9 +553,10 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                         new_frame = true;
                     }
                     if id == graphics::FILE_QUERY_ID {
-                        app.by_file = ok;
-                        // If it said no, it didn't delete the file either.
-                        let _ = std::fs::remove_file(graphics::temp_path(0));
+                        if let Some(path) = app.file_probe.take() {
+                            app.by_file = ok;
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
                 Msg::Term(Event::Focus(focused)) => {
@@ -608,10 +641,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                         }
                         Some(PageEvent::Loading(loading)) => {
                             app.loading = loading;
-                            redraw = true;
-                        }
-                        Some(PageEvent::Copy(text)) => {
-                            app.copy(&text);
                             redraw = true;
                         }
                         None => {}
@@ -896,7 +925,7 @@ impl App {
         if self.help {
             crate::splash::Splash::hide(&mut out);
         } else {
-            splash.draw(&mut out, cols, rows, cell, 2);
+            splash.draw(&mut self.page.files, &mut out, cols, rows, cell, 2);
         }
         // The splash paints the pane black, help and all.
         self.help_rect = None;
@@ -945,6 +974,8 @@ impl App {
     /// The page shown is at `url` now.
     fn went_to(&mut self, url: String) {
         log(format_args!("url {url}"));
+        self.copy_request = CopyRequest::default();
+        self.describe_request = None;
         self.committed |= url != "about:blank";
         self.history.record(&url);
         self.url = if url == "about:blank" { String::new() } else { url };
@@ -1134,7 +1165,7 @@ impl App {
         }
         match self.bindings.action(&key, focused || self.find.is_some()) {
             Some(Action::Quit) => return true,
-            Some(action) if self.perform(action, &key) => return false,
+            Some(action) if self.perform(action) => return false,
             _ => {}
         }
         match key.code {
@@ -1162,7 +1193,7 @@ impl App {
 
     /// Carry out a bound action. Returns false if it doesn't apply now, so
     /// the key goes on as if unbound.
-    fn perform(&mut self, action: Action, key: &Key) -> bool {
+    fn perform(&mut self, action: Action) -> bool {
         match action {
             Action::Address => {
                 self.find = None;
@@ -1185,15 +1216,24 @@ impl App {
             Action::ZoomReset => self.zoom_to_fit(),
             Action::Help => self.open_help(),
             Action::Copy => {
-                // The field being edited, or the page: the page reports what
-                // it copies, and kb passes it to the clipboard.
                 let field = match &self.find {
                     Some(field) => Some(field.text()),
                     None => self.bar.focused().then(|| self.bar.text()),
                 };
+                self.copy_request = CopyRequest::default();
                 match field {
                     Some(text) => self.copy(&text),
-                    None => self.chrome.key(&Key { code: KeyCode::Char('c'), ctrl: true, cmd: false, ..*key }),
+                    None => {
+                        // A dedicated JS world reads the DOM with browser-provided APIs,
+                        // even when a site has replaced selection methods in its own world.
+                        let id = self.chrome.request(
+                            "Page.createIsolatedWorld",
+                            serde_json::json!({
+                                "frameId": self.chrome.main_frame(), "worldName": "kb-selection"
+                            }),
+                        );
+                        self.copy_request = CopyRequest { world: Some(id), selection: None };
+                    }
                 }
             }
             Action::Inspect if self.inspecting => self.stop_inspecting(),
@@ -1215,7 +1255,7 @@ impl App {
 
     /// Show a short note at the right of the bar.
     fn note(&mut self, text: &str) {
-        self.notice = Some((text.to_owned(), Instant::now()));
+        self.notice = Some((text.chars().filter(|c| !c.is_control()).collect(), Instant::now()));
     }
 
     /// Put text on the system clipboard, through the terminal.
@@ -1238,6 +1278,23 @@ impl App {
     /// Handle Chrome's reply to a request the app made. Returns whether it
     /// was one.
     fn reply(&mut self, id: u64, message: &serde_json::Value) -> bool {
+        if CopyRequest::consume(&mut self.copy_request.world, id) {
+            if let Some(context) = message["result"]["executionContextId"].as_u64() {
+                self.copy_request.selection = Some(self.chrome.request(
+                    "Runtime.evaluate",
+                    serde_json::json!({
+                        "expression": SELECTION, "contextId": context, "returnByValue": true
+                    }),
+                ));
+            }
+            return true;
+        }
+        if CopyRequest::consume(&mut self.copy_request.selection, id) {
+            if let Some(text) = message["result"]["result"]["value"].as_str() {
+                self.copy(text);
+            }
+            return true;
+        }
         if self.pointer_request == Some(id) {
             self.pointer_request = None;
             let shape = message["result"]["result"]["value"].as_str().unwrap_or("default");
@@ -1256,12 +1313,9 @@ impl App {
             if lines.is_empty() {
                 return true;
             }
-            if let Some(selector) = value["selector"].as_str() {
-                term::copy(selector);
-            }
             let again = self.bindings.keys_for(Action::Inspect).into_iter().next().unwrap_or_default();
             lines.push(String::new());
-            lines.push(format!("\tThe selector is copied. {again} inspects another; any key closes this."));
+            lines.push(format!("\t{again} inspects another; any key closes this."));
             self.panel = Some(lines);
             self.open_help();
             return true;
@@ -1338,8 +1392,8 @@ impl App {
         // The mouse's back and forward buttons, as in any browser.
         if mouse.kind == MouseKind::Press {
             match mouse.button {
-                Some(Button::Back) => return self.perform(Action::Back, &Key::default()),
-                Some(Button::Forward) => return self.perform(Action::Forward, &Key::default()),
+                Some(Button::Back) => return self.perform(Action::Back),
+                Some(Button::Forward) => return self.perform(Action::Forward),
                 _ => {}
             }
         }
@@ -1474,5 +1528,16 @@ impl App {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    #[test]
+    fn only_the_requested_reply_is_consumed_once() {
+        let mut pending = Some(17);
+        assert!(!super::CopyRequest::consume(&mut pending, 16));
+        assert!(super::CopyRequest::consume(&mut pending, 17));
+        assert!(!super::CopyRequest::consume(&mut pending, 17));
     }
 }

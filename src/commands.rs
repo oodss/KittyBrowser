@@ -94,7 +94,7 @@ pub const COMMANDS: &[Command] = &[
             option("selector", "CSS", "capture only this element"),
             flag("full", "capture the whole page, not just the visible part"),
             option("size", "SIZE", "small (half size, for a quick look), normal (the default), sharp (device pixels, to check fine detail), or a width in pixels such as 800"),
-            option(OUT, "FILE", "where to save the PNG (default: a new file in the temp directory); its path is printed"),
+            option(OUT, "FILE", "where to save the PNG (default: a private file in ~/.kittybrowser/screenshots); its path is printed"),
         ],
     },
     Command {

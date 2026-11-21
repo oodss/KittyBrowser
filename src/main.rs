@@ -59,8 +59,22 @@ fn usage_error(message: &str) -> ! {
 pub fn data_dir() -> Result<std::path::PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     let dir = std::path::PathBuf::from(home).join(".kittybrowser");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    private_directory(&dir).map_err(|e| format!("securing {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+fn private_directory(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    // Tighten directories created by earlier versions before using their contents.
+    let handle = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    if handle.metadata()?.permissions().mode() & 0o777 != 0o700 {
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn main() {
@@ -132,7 +146,7 @@ fn main() {
     if let Err(err) = result {
         // An empty error has been explained already, at more length.
         if !err.is_empty() {
-            eprintln!("kb: {err}");
+            eprintln!("kb: {}", term::printable(&err));
         }
         std::process::exit(1);
     }

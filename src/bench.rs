@@ -280,6 +280,7 @@ fn run_modes(
         bench.settle(Duration::from_millis(500))?;
 
         term::write(graphics::DELETE);
+        let mut files = graphics::FrameFiles::default();
         let mut tiles = graphics::Tiles::default();
         let mut layers = crate::term::layers::Layers::default();
         let mut samples = Vec::new();
@@ -320,7 +321,9 @@ fn run_modes(
                     if !graphics::fits((pixels.width, pixels.height), cols, rows, (cell_w, cell_h)) {
                         return Err("frames don't line up with the cells, so they can't be tiled".into());
                     }
-                    tiles.draw(&mut out, pixels, cols, rows, (cell_w, cell_h), 2).ok_or("couldn't write a tile")?;
+                    tiles
+                        .draw(&mut out, &mut files, pixels, cols, rows, (cell_w, cell_h), 2)
+                        .ok_or("couldn't write a tile")?;
                 }
                 Transfer::File => {
                     let bytes = crate::base64::decode(&data).ok_or("Chrome sent a damaged frame")?;
@@ -329,8 +332,7 @@ fn run_modes(
                         Source::Jpeg(_) => graphics::decode_jpeg(&bytes),
                     }
                     .ok_or("couldn't decode a frame")?;
-                    let path = graphics::next_path();
-                    std::fs::write(&path, &pixels.data).map_err(|e| format!("writing {}: {e}", path.display()))?;
+                    let path = files.write(&pixels.data).map_err(|e| format!("writing frame: {e}"))?;
                     graphics::put_file(&mut out, &path, &pixels, cols, rows);
                 }
             }
@@ -449,14 +451,14 @@ pub fn run(words: &[String]) -> i32 {
     }
 
     if let Err(error) = term::enter() {
-        eprintln!("kb bench: {error}");
+        eprintln!("kb bench: {}", error);
         return 1;
     }
     let result = measure(&url, steps, scale, scene, modes.as_deref());
     term::leave();
     match result {
         Ok(report) => {
-            print!("{report}");
+            print!("{}", term::printable(&report));
             if let Some(path) = out {
                 if let Err(error) = std::fs::write(&path, &report) {
                     eprintln!("kb bench: writing {path}: {error}");
@@ -466,7 +468,7 @@ pub fn run(words: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("kb bench: {error}");
+            eprintln!("kb bench: {}", term::printable(&error));
             1
         }
     }

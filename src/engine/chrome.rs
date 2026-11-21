@@ -23,46 +23,10 @@ pub enum PageEvent {
     Frame(String),
     Url(String),
     Loading(bool),
-    /// The page copied this text (the selection, or a copy button's).
-    Copy(String),
     /// Another window is shown now, at this URL: one a page opened, or the
     /// one under a window that closed.
     Shown(String),
 }
-
-/// Run in every page before its own scripts: report what the page copies
-/// through the `__kbCopy` binding, so kb can put it on the terminal's
-/// clipboard. Headless Chrome's own clipboard goes nowhere.
-const COPY_HOOK: &str = r#"(() => {
-  if (window.__kbCopyHooked) return;
-  window.__kbCopyHooked = true;
-  const send = text => { try { if (typeof text === 'string' && text) __kbCopy(text); } catch (e) {} };
-  const selected = () => {
-    const el = document.activeElement;
-    const field = el && (el.localName === 'textarea' ||
-      (el.localName === 'input' && /^(text|search|url|tel|email|number|)$/.test(el.type)));
-    if (field && el.selectionStart !== el.selectionEnd) return el.value.slice(el.selectionStart, el.selectionEnd);
-    return String(getSelection());
-  };
-  // A page that sets the clipboard's text in its copy handler wins over the selection.
-  let pending = null;
-  const setData = DataTransfer.prototype.setData;
-  DataTransfer.prototype.setData = function (type, value) {
-    if (pending && /^text(\/plain)?$/i.test(type)) pending.text = String(value);
-    return setData.call(this, type, value);
-  };
-  for (const type of ['copy', 'cut']) {
-    addEventListener(type, () => {
-      const mine = pending = {text: null, selection: selected()};
-      setTimeout(() => { if (pending === mine) pending = null; send(mine.text ?? mine.selection); });
-    }, true);
-  }
-  // Copy buttons write with the Clipboard API, which headless Chrome may refuse.
-  if (navigator.clipboard) {
-    const write = navigator.clipboard.writeText.bind(navigator.clipboard);
-    navigator.clipboard.writeText = text => { send(String(text)); return write(text).catch(() => {}); };
-  }
-})()"#;
 
 /// Modifier bits as the DevTools protocol defines them.
 pub const ALT: u32 = 1;
@@ -526,8 +490,6 @@ impl Chrome {
         }
         // Without this the page believes it is in the background: no caret, no focus styles.
         settings.push(("Emulation.setFocusEmulationEnabled", json!({"enabled": true})));
-        settings.push(("Runtime.addBinding", json!({"name": "__kbCopy"})));
-        settings.push(("Page.addScriptToEvaluateOnNewDocument", json!({"source": COPY_HOOK})));
         for (method, params) in &settings {
             call(&mut tx, &mut rx, method, params.clone(), s)?;
         }
@@ -642,9 +604,6 @@ impl Chrome {
         let method = message["method"].as_str()?.to_owned();
         let params = &mut message["params"];
         match method.as_str() {
-            "Runtime.bindingCalled" if params["name"] == "__kbCopy" => {
-                Some(PageEvent::Copy(params["payload"].as_str()?.to_owned()))
-            }
             "Page.screencastFrame" => {
                 // Chrome stops sending frames until each one is acknowledged.
                 self.check_frame_size(&params["metadata"]);

@@ -38,6 +38,12 @@ pub fn copy(text: &str) {
     write(format!("\x1b]52;c;{}\x1b\\", crate::base64::encode(text.as_bytes())).as_bytes());
 }
 
+/// Page text can contain terminal commands. Preserve CLI line layout and
+/// replace every other control character before writing human-readable text.
+pub fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() && !matches!(c, '\n' | '\t') { '�' } else { c }).collect()
+}
+
 pub fn write(bytes: &[u8]) {
     let mut out = io::stdout().lock();
     let _ = out.write_all(bytes);

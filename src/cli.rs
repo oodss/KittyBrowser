@@ -2,8 +2,9 @@
 
 use crate::commands::{self, COMMANDS};
 use crate::control::{self, Output};
+use crate::term::printable;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn usage() -> String {
     let mut text = String::from(
@@ -77,7 +78,7 @@ pub fn run(mut words: &[String]) -> i32 {
     let mut args = match command.parse(words) {
         Ok(args) => args,
         Err(error) => {
-            eprintln!("kb ctl: {error}");
+            eprintln!("kb ctl: {}", printable(&error));
             return 2;
         }
     };
@@ -91,7 +92,7 @@ pub fn run(mut words: &[String]) -> i32 {
             Ok(path) => args["url"] = json!(format!("file://{}", path.display())),
             Err(_) if looks_like_a_file(url) => {
                 let path = std::env::current_dir().unwrap_or_default().join(url);
-                eprintln!("kb ctl: no such file: {}", path.display());
+                eprintln!("kb ctl: no such file: {}", printable(&path.display().to_string()));
                 return 1;
             }
             Err(_) => {}
@@ -100,38 +101,56 @@ pub fn run(mut words: &[String]) -> i32 {
 
     match control::request(command.name, args) {
         Ok(Output::Text(text)) => {
-            println!("{text}");
+            println!("{}", printable(&text));
             0
         }
         Ok(Output::Image(png)) => {
-            let path = out.unwrap_or_else(|| {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.as_millis());
-                std::env::temp_dir().join(format!("kb-screenshot-{stamp}.png"))
-            });
-            let saved = crate::base64::decode(&png).ok_or("kb sent a damaged image".to_owned()).and_then(|bytes| {
-                if let Some(folder) = path.parent().filter(|folder| !folder.as_os_str().is_empty()) {
-                    let _ = std::fs::create_dir_all(folder);
-                }
-                std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
-            });
+            let saved = crate::base64::decode(&png)
+                .ok_or("kb sent a damaged image".to_owned())
+                .and_then(|bytes| save_image(out.as_deref(), &bytes));
             match saved {
-                Ok(()) => {
-                    println!("{}", path.display());
+                Ok(path) => {
+                    println!("{}", printable(&path.display().to_string()));
                     0
                 }
                 Err(error) => {
-                    eprintln!("kb ctl: {error}");
+                    eprintln!("kb ctl: {}", printable(&error));
                     1
                 }
             }
         }
         Err(error) => {
-            eprintln!("kb ctl: {error}");
+            eprintln!("kb ctl: {}", printable(&error));
             1
         }
     }
+}
+
+/// Publish a finished 0600 file in one rename. Replacing an existing
+/// destination also replaces its old permissions and never follows a link.
+fn save_image(out: Option<&Path>, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let folder = match out {
+        Some(path) => path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_owned(),
+        None => crate::data_dir()?.join("screenshots"),
+    };
+    let save = || -> std::io::Result<PathBuf> {
+        if out.is_none() {
+            crate::private_directory(&folder)?;
+        } else {
+            std::fs::create_dir_all(&folder)?;
+        }
+        let mut file = tempfile::Builder::new().prefix("kb-screenshot-").suffix(".png").tempfile_in(&folder)?;
+        file.write_all(bytes)?;
+        match out {
+            Some(path) => {
+                file.persist(path)?;
+                Ok(path.to_owned())
+            }
+            None => Ok(file.into_temp_path().keep()?),
+        }
+    };
+    save().map_err(|e| format!("saving screenshot in {}: {e}", folder.display()))
 }
 
 /// `kb list`: the kbs running now, one per line, numbered. Returns the
@@ -155,7 +174,7 @@ pub fn list() -> i32 {
         };
         // The pane tells kbs apart: an agent knows the one it split. The id
         // names this run of it, so a number taken over later isn't mistaken.
-        println!("{instance}\t{page}\t{pane}\t{id}");
+        println!("{}", printable(&format!("{instance}\t{page}\t{pane}\t{id}")));
     }
     0
 }
@@ -163,6 +182,20 @@ pub fn list() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenshot_replacement_is_private_and_leaves_link_target_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let previous = dir.path().join("previous");
+        let out = dir.path().join("out.png");
+        std::fs::write(&previous, b"original").unwrap();
+        symlink(&previous, &out).unwrap();
+        save_image(Some(&out), b"frame").unwrap();
+        assert_eq!(std::fs::read(&previous).unwrap(), b"original");
+        assert_eq!(std::fs::read(&out).unwrap(), b"frame");
+        assert_eq!(out.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    }
 
     #[test]
     fn files_and_hosts() {

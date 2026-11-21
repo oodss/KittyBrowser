@@ -133,7 +133,7 @@ impl AddressBar {
     }
 
     pub fn set_completion(&mut self, completion: Option<String>) {
-        self.completion = completion.unwrap_or_default().chars().collect();
+        self.completion = completion.unwrap_or_default().chars().filter(|c| !c.is_control()).collect();
     }
 
     pub fn focused(&self) -> bool {
@@ -153,7 +153,7 @@ impl AddressBar {
     }
 
     pub fn set_text(&mut self, text: &str) {
-        self.text = text.chars().collect();
+        self.text = text.chars().filter(|c| !c.is_control()).collect();
         self.cursor = self.text.len();
         self.scroll = 0;
         self.selected = false;
@@ -368,7 +368,7 @@ pub struct Rect {
 /// too long for the screen are cut, and lines that don't fit are dropped.
 pub fn render_box(out: &mut Vec<u8>, lines: &[String], cols: u16, rows: u16) -> Rect {
     let inner = lines.iter().map(|line| unmark(line).chars().count()).max().unwrap_or(0);
-    let width = (inner as u16 + 4).min(cols);
+    let width = inner.saturating_add(4).min(cols as usize) as u16;
     let height = (lines.len() as u16 + 2).min(rows.saturating_sub(1));
     let col = (cols - width) / 2 + 1;
     let row = 2 + (rows.saturating_sub(1) - height) / 2;
@@ -385,7 +385,7 @@ pub fn render_box(out: &mut Vec<u8>, lines: &[String], cols: u16, rows: u16) -> 
             Some('\t') => colors.box_dim.as_str(),
             _ => box_style,
         };
-        let text: String = unmark(line).chars().take(text_width).collect();
+        let text: String = unmark(line).chars().filter(|c| !c.is_control()).take(text_width).collect();
         let pad = text_width - text.chars().count();
         let _ = write!(s, "\x1b[{};{col}H{box_style}│ {style}{text}{:pad$}{box_style} │", row + 1 + n as u16, "");
     }
@@ -527,6 +527,19 @@ pub fn normalize_url(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_controls_never_reach_panel_or_address_output() {
+        let page_text = "one\u{1b}two\u{85}three";
+        let mut out = Vec::new();
+        super::render_box(&mut out, &[page_text.into()], 80, 20);
+        assert!(String::from_utf8(out).unwrap().contains("onetwothree"));
+        let mut bar = super::AddressBar::default();
+        bar.set_text(page_text);
+        bar.set_completion(Some(page_text.into()));
+        assert!(!bar.text().contains(char::is_control));
+        assert_eq!(crate::term::printable("one\u{1b}\r\u{85}\ntwo\tthree"), "one���\ntwo\tthree");
+    }
+
     #[test]
     fn box_is_centred_below_the_bar() {
         let mut out = Vec::new();

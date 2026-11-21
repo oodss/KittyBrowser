@@ -64,7 +64,15 @@ impl Splash {
     /// Append the escapes that draw the next frame in the middle of a
     /// `cols` x `rows` area of `cell`-pixel cells whose top row is `top`.
     /// Needs a terminal that reads files.
-    pub fn draw(&mut self, out: &mut Vec<u8>, cols: u16, rows: u16, cell: (u32, u32), top: u16) {
+    pub fn draw(
+        &mut self,
+        files: &mut graphics::FrameFiles,
+        out: &mut Vec<u8>,
+        cols: u16,
+        rows: u16,
+        cell: (u32, u32),
+        top: u16,
+    ) {
         let still = self.last.is_some() && self.started.elapsed() > ANIMATE_FOR;
         let pixels = &self.frames[if still { FRAMES / 4 } else { self.next }];
         self.next = (self.next + 1) % FRAMES;
@@ -86,8 +94,7 @@ impl Splash {
         }
         out.extend_from_slice(b"\x1b[0m");
 
-        let path = graphics::next_path();
-        if std::fs::write(&path, &pixels.data).is_ok() {
+        if let Ok(path) = files.write(&pixels.data) {
             out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
             graphics::put_image_file(out, &path, pixels, ID, width, height);
         }

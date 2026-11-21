@@ -6,6 +6,7 @@ use super::layers::Layers;
 
 #[derive(Default)]
 pub struct PageImage {
+    pub files: graphics::FrameFiles,
     /// The page as tiles, when it is drawn that way.
     tiles: Tiles,
     /// The page through the pty, moved as it scrolls and only what changed
@@ -110,7 +111,7 @@ impl PageImage {
         let drawn = match drawer {
             Drawer::Tiles => pixels
                 .take()
-                .and_then(|pixels| self.tiles.draw(out, pixels, cols, rows, cell, top))
+                .and_then(|pixels| self.tiles.draw(out, &mut self.files, pixels, cols, rows, cell, top))
                 .map(|sent| format!("{sent:?}")),
             Drawer::Layers => self.layers.draw(out, png, cols, rows, cell, top).map(|sent| format!("{sent:?}")),
             Drawer::Whole => None,
@@ -122,9 +123,8 @@ impl PageImage {
         // screen is in no known state, so it is cleared for the frame whole.
         self.hand_to(out, Drawer::Whole);
         out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
-        let path = graphics::next_path();
-        match pixels.filter(|pixels| std::fs::write(&path, &pixels.data).is_ok()) {
-            Some(pixels) => {
+        match pixels.and_then(|pixels| self.files.write(&pixels.data).ok().map(|path| (pixels, path))) {
+            Some((pixels, path)) => {
                 graphics::put_file(out, &path, &pixels, cols, rows);
                 // The terminal deletes each file once read; this covers one
                 // it didn't get to.
