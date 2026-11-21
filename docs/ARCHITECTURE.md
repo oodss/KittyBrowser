@@ -12,15 +12,20 @@ terminal ──────────► app ◄──────────
    └── top bar (text) + page (kitty graphics) ◄── app
 ```
 
-Three threads. One reads the terminal and decodes it into events; one reads
-messages from Chrome; the main thread owns all state, receives both on one
-channel, and is the only one that writes to the terminal or to Chrome. It
-draws only when something changed. There is no async runtime.
+Two reader threads deliver terminal input and Chrome messages to the main
+loop. The main loop owns browser and renderer state and sends input to
+Chrome. A writer thread sends complete terminal updates in order.
 
-Each pass of the loop drains everything waiting on the channel. If several
-frames arrived, only the newest is drawn, and a burst of mouse moves collapses
-to the last one. Writing a frame to the terminal blocks until the terminal has
-taken it, which is what keeps a slow terminal from falling behind.
+While a write is in flight, the main loop keeps the latest Chrome frame
+and UI state. It prepares the next delta only after the write completes,
+so a skipped Chrome frame never becomes the base for a partial update.
+Chrome keeps receiving screencast acknowledgements at the usual rate, so
+the final repaint of a page can arrive while the writer is busy. Keyboard
+input, mouse input and control requests remain live. A burst of pointer moves still collapses to the last one. File-transfer
+reply deadlines start after the update has been written. With Chrome and a
+release build installed locally, `python3 tests/slow-terminal.py` exercises
+keyboard input while a PTY has stopped reading and verifies the final PNG
+when the reader resumes.
 
 Rex and other SGR terminals report scrolling as discrete wheel ticks. The
 first tick goes straight to Chrome. At a fixed pointer position, subsequent

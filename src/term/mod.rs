@@ -27,15 +27,37 @@ const LEAVE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b]22;<\x1b\\\
 \x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\
 \x1b[0 q\x1b[?25h\x1b[?1049l";
 
-/// Set the mouse pointer's shape over the pane, by its CSS name (pointer,
-/// text, default, ...). Terminals that don't know OSC 22 ignore it.
-pub fn pointer(shape: &str) {
-    write(format!("\x1b]22;{shape}\x1b\\").as_bytes());
+/// Terminal side effects that arrive while a frame is being written. Only the
+/// latest clipboard value and pointer shape need to reach the next update.
+#[derive(Default)]
+pub struct PendingOutput {
+    pub clear: bool,
+    pub query_cell: bool,
+    pub pointer: Option<String>,
+    pub clipboard: Option<String>,
 }
 
-/// Put `text` on the system clipboard, through the terminal (OSC 52).
-pub fn copy(text: &str) {
-    write(format!("\x1b]52;c;{}\x1b\\", crate::base64::encode(text.as_bytes())).as_bytes());
+impl PendingOutput {
+    pub fn any(&self) -> bool {
+        self.clear || self.query_cell || self.pointer.is_some() || self.clipboard.is_some()
+    }
+
+    pub fn append(&mut self, out: &mut Vec<u8>) {
+        let changes = std::mem::take(self);
+        if changes.clear {
+            out.extend_from_slice(b"\x1b[2J");
+            out.extend_from_slice(graphics::DELETE);
+        }
+        if changes.query_cell {
+            out.extend_from_slice(b"\x1b[16t");
+        }
+        if let Some(shape) = changes.pointer {
+            out.extend_from_slice(format!("\x1b]22;{shape}\x1b\\").as_bytes());
+        }
+        if let Some(text) = changes.clipboard {
+            out.extend_from_slice(format!("\x1b]52;c;{}\x1b\\", crate::base64::encode(text.as_bytes())).as_bytes());
+        }
+    }
 }
 
 /// Page text can contain terminal commands. Preserve CLI line layout and
@@ -48,12 +70,6 @@ pub fn write(bytes: &[u8]) {
     let mut out = io::stdout().lock();
     let _ = out.write_all(bytes);
     let _ = out.flush();
-}
-
-/// Ask the terminal for its cell size in pixels; the answer arrives as an
-/// `input::Event::CellSize`.
-pub fn query_cell_size() {
-    write(b"\x1b[16t");
 }
 
 /// Put the terminal in raw mode and take over the screen.
@@ -160,6 +176,23 @@ fn graphics_answer(replies: &[u8]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::graphics_answer;
+
+    #[test]
+    fn pending_controls_share_one_update_and_are_consumed_once() {
+        let mut changes = super::PendingOutput {
+            clear: true,
+            query_cell: true,
+            pointer: Some("pointer".into()),
+            clipboard: Some("copy".into()),
+        };
+        let mut out = Vec::new();
+        changes.append(&mut out);
+        assert_eq!(out, b"\x1b[2J\x1b_Ga=d,d=A,q=2\x1b\\\x1b[16t\x1b]22;pointer\x1b\\\x1b]52;c;Y29weQ==\x1b\\");
+        assert!(!changes.any());
+        out.clear();
+        changes.append(&mut out);
+        assert!(out.is_empty());
+    }
 
     #[test]
     fn reads_whether_the_terminal_draws_graphics() {

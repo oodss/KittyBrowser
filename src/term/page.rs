@@ -80,6 +80,14 @@ impl PageImage {
         false
     }
 
+    /// A slow PTY can keep the filename itself in transit. Start the reply
+    /// timeout only once that write finishes. Later UI writes do not extend it.
+    pub fn written(&mut self, now: Instant) {
+        if !self.files.pending.is_empty() {
+            self.sent.get_or_insert(now);
+        }
+    }
+
     pub fn expire(&mut self, now: Instant) -> bool {
         if self.sent.is_some_and(|sent| now.duration_since(sent) >= FILE_TIMEOUT) {
             self.fallback();
@@ -129,7 +137,7 @@ impl PageImage {
         cell: (u32, u32),
         top: u16,
     ) -> String {
-        if self.sent.is_some() {
+        if !self.files.pending.is_empty() {
             self.deferred = true;
             return "waiting for terminal to read the previous frame".to_owned();
         }
@@ -167,9 +175,6 @@ impl PageImage {
             } else if out.len() > before_draw {
                 self.first_patch.get_or_insert_with(Instant::now);
             }
-            if !self.files.pending.is_empty() {
-                self.sent = Some(Instant::now());
-            }
             return drawn;
         }
         if drawer == Drawer::Tiles {
@@ -183,7 +188,6 @@ impl PageImage {
         if let Some(pixels) = pixels {
             if let Ok(path) = self.files.page_file(graphics::IMAGE_ID, &pixels.data) {
                 graphics::put_file(out, path, &pixels, cols, rows);
-                self.sent = Some(Instant::now());
                 return "the whole frame, by file".to_owned();
             }
             self.fallback();
@@ -273,7 +277,10 @@ mod tests {
             let path = image.files.pending[0].1.to_path_buf();
             assert!(path.exists());
             assert!(String::from_utf8_lossy(&lost).contains("q=0"));
-            let sent = image.sent.unwrap();
+            let sent = Instant::now() + FILE_TIMEOUT * 3;
+            assert!(!image.expire(sent));
+            image.written(sent);
+            image.written(sent + FILE_TIMEOUT / 2);
             assert!(!image.expire(sent));
             if timeout {
                 assert!(image.expire(sent + FILE_TIMEOUT));
