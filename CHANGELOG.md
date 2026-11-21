@@ -6,6 +6,10 @@ Notable changes to kb. The format follows
 
 ## Unreleased
 
+- Release archives now carry GitHub keyless build attestations. The installer
+  verifies the archive, repository, workflow, version tag and source commit
+  before unpacking, and release builds use the reviewed Rust version in
+  `Cargo.toml` with commit-pinned actions.
 - `kb --headless URL` runs kb in the background without a pane, driven by
   `kb ctl` alone, with the same profile and commands. It prints its number,
   `kb ctl -i N quit` stops it (and quits any kb), and it stops by itself

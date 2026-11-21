@@ -18,6 +18,10 @@ env:
 
 jobs:
   build:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -33,13 +37,27 @@ jobs:
             os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Check out source
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Check release security rules
+        run: sh tests/release-security.sh
+      - name: Install Rust toolchain
+        run: |
+          rust_version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          test -n "$rust_version"
+          echo "RUST_VERSION=$rust_version" >> "$GITHUB_ENV"
+          rustup toolchain install "$rust_version" --profile minimal --no-self-update
+          rustup target add --toolchain "$rust_version" ${{ matrix.target }}
       # No build cache: a release is built from nothing, so a cache written
       # by another workflow can't end up in it.
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo "+$RUST_VERSION" build --release --locked --target ${{ matrix.target }}
       - name: Package
         run: |
           name=kb-${{ matrix.target }}
@@ -47,19 +65,23 @@ jobs:
           cp target/${{ matrix.target }}/release/kb README.md LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - name: Attest archive
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: kb-${{ matrix.target }}.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kb-${{ matrix.target }}
           path: kb-${{ matrix.target }}.tar.gz*
 
   publish:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
       # Pinned: it runs with write access to the repository.
