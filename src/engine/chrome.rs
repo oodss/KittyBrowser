@@ -630,6 +630,10 @@ impl Chrome {
         }
     }
 
+    pub fn browser_request(&mut self, method: &str, params: Value) -> io::Result<u64> {
+        self.tx.send(method, params, None)
+    }
+
     fn send_browser(&mut self, method: &str, params: Value) {
         let _ = self.tx.send(method, params, None);
     }
