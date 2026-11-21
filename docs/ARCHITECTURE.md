@@ -132,6 +132,16 @@ to cover the cells, and the extra pixel is cropped, so tiles and page line
 up exactly. A fixed viewport (`kb ctl viewport`) is scaled to fit and so is
 always sent whole.
 
+For file-backed pages, kb keeps at most one batch outstanding. It requests
+a graphics reply for each image and keeps each temporary file until that
+reply. While the terminal is reading, kb retains Chrome's latest frame.
+An error or two seconds without the batch completing switches the page to
+whole PNG frames through the pty for the rest of the session. Regaining
+focus rebuilds the base even at the same size. After five seconds of relying
+on partial updates, kb sends a fresh base once, including for a page that
+has since stopped changing. This repairs a client that lost placements
+after its server acknowledged them.
+
 **Over a network** (`term::layers`). When the terminal can't read files,
 which is always the case over ssh, every byte crosses the link: a whole
 2736x1666 frame is about 1.1 MB, and resending it for each scroll step or
@@ -272,10 +282,7 @@ for `scrollWidth`; if that is wider than the viewport it zooms out to fit.
 The page and its tiles are placed with a z-index below -1,073,741,824, which
 the protocol defines as under text and under cells with a background colour
 of their own. So the help box (Ctrl+/) is ordinary coloured text drawn over
-the page, and blanking its cells shows the page again. The startup logo
-(`splash.rs`) is a separate image above the page, animated by sending a new
-frame every 60 ms for 12 seconds; the light's path is the ring's ellipse,
-measured from the logo, dimmed where it passes behind the sphere.
+the page, and blanking its cells shows the page again.
 
 Find (Command+F) puts a second such field in the address bar's place; each
 change runs `window.find` in the page, which selects the match and scrolls

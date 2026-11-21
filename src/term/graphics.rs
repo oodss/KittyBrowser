@@ -7,7 +7,7 @@
 //! docs/ARCHITECTURE.md has the measurements.
 
 /// Every frame reuses this id, so a new frame replaces the previous one.
-const IMAGE_ID: u32 = 1;
+pub(super) const IMAGE_ID: u32 = 1;
 
 /// Removes every image from the screen.
 pub const DELETE: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
@@ -70,9 +70,7 @@ pub struct Pixels {
 pub fn decode_png(bytes: &[u8], mut data: Vec<u8>) -> Option<Pixels> {
     // png 0.18 reads from anything that can seek, so a slice goes in a cursor.
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    // Frames come from Chrome over a pipe and the logo is built in, neither
-    // off a disk or a network: checking checksums is a tenth of the time
-    // for nothing.
+    // Chrome supplies these frames over a pipe; skip the redundant checksum pass.
     decoder.ignore_checksums(true);
     let mut reader = decoder.read_info().ok()?;
     data.resize(reader.output_buffer_size()?, 0);
@@ -103,10 +101,12 @@ pub fn decode_jpeg(bytes: &[u8]) -> Option<Pixels> {
 #[derive(Default)]
 pub struct FrameFiles {
     directory: Option<tempfile::TempDir>,
+    /// One batch of page transfers. Terminals may read after the next Chrome frame.
+    pub(super) pending: Vec<(u32, tempfile::TempPath)>,
 }
 
 impl FrameFiles {
-    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    fn create(&mut self, bytes: &[u8]) -> std::io::Result<tempfile::TempPath> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         if self.directory.is_none() {
@@ -120,7 +120,21 @@ impl FrameFiles {
         let directory = self.directory.as_ref().expect("initialized above");
         let mut file = tempfile::Builder::new().prefix("tty-graphics-protocol-kb-").tempfile_in(directory.path())?;
         file.write_all(bytes)?;
-        Ok(file.into_temp_path().keep()?)
+        Ok(file.into_temp_path())
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+        Ok(self.create(bytes)?.keep()?)
+    }
+
+    pub fn page_file(&mut self, id: u32, bytes: &[u8]) -> std::io::Result<&std::path::Path> {
+        let path = self.create(bytes)?;
+        self.pending.push((id, path));
+        Ok(self.pending.last().unwrap().1.as_ref())
+    }
+
+    pub fn finish_batch(&mut self) {
+        self.pending.clear();
     }
 }
 
@@ -129,12 +143,6 @@ impl FrameFiles {
 /// the file itself and deletes it, so nothing but its name crosses the pty.
 pub fn put_file(out: &mut Vec<u8>, path: &std::path::Path, pixels: &Pixels, cols: u16, rows: u16) {
     put_raw_file(out, path, (pixels.width, pixels.height), pixels.alpha, IMAGE_ID, PAGE_Z, cols, rows);
-}
-
-/// Append the escape that draws the pixels saved at `path` at the cursor,
-/// as image `id`, filling `cols` x `rows` cells, above the page.
-pub fn put_image_file(out: &mut Vec<u8>, path: &std::path::Path, pixels: &Pixels, id: u32, cols: u16, rows: u16) {
-    put_raw_file(out, path, (pixels.width, pixels.height), pixels.alpha, id, 0, cols, rows);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -153,7 +161,7 @@ fn put_raw_file(
     let (width, height) = size;
     out.extend_from_slice(
         format!(
-            "\x1b_Ga=T,f={format},s={width},v={height},t=t,i={id},p=1,z={z},q=2,C=1,c={cols},r={rows};{name}\x1b\\"
+            "\x1b_Ga=T,f={format},s={width},v={height},t=t,i={id},p=1,z={z},q=0,C=1,c={cols},r={rows};{name}\x1b\\"
         )
         .as_bytes(),
     );
@@ -188,8 +196,6 @@ pub struct Tiles {
     shown: Option<Pixels>,
     /// The ids of the tiles lying over the page.
     overlaid: Vec<u32>,
-    /// The last draw's files, in case the terminal didn't delete them.
-    last: Vec<std::path::PathBuf>,
 }
 
 impl Tiles {
@@ -214,9 +220,6 @@ impl Tiles {
         cell: (u32, u32),
         top: u16,
     ) -> Option<Drawn> {
-        for path in self.last.drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
         let bytes = if new.alpha { 4 } else { 3 };
         let (cell_w, cell_h) = (cell.0 as usize, cell.1 as usize);
         let new = crop(new, cols as u32 * cell.0, rows as u32 * cell.1, bytes)?;
@@ -250,20 +253,18 @@ impl Tiles {
             for id in self.overlaid.drain(..) {
                 out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").as_bytes());
             }
-            let path = files.write(&new.data).ok()?;
+            let path = files.page_file(IMAGE_ID, &new.data).ok()?;
             out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
-            put_raw_file(out, &path, (new.width, new.height), new.alpha, IMAGE_ID, PAGE_Z, cols, rows);
-            self.last.push(path);
+            put_raw_file(out, path, (new.width, new.height), new.alpha, IMAGE_ID, PAGE_Z, cols, rows);
             Drawn::Whole
         } else {
             for &(id, col, row, tile_cols, tile_rows) in &changed {
                 let (x, y) = (col as u32 * cell.0, row as u32 * cell.1);
                 let tile = cut(&new, x, y, tile_cols as u32 * cell.0, tile_rows as u32 * cell.1);
-                let path = files.write(&tile.data).ok()?;
+                let path = files.page_file(id, &tile.data).ok()?;
                 out.extend_from_slice(format!("\x1b[{};{}H", top + row, col + 1).as_bytes());
                 let size = (tile.width, tile.height);
-                put_raw_file(out, &path, size, new.alpha, id, TILE_Z, tile_cols, tile_rows);
-                self.last.push(path);
+                put_raw_file(out, path, size, new.alpha, id, TILE_Z, tile_cols, tile_rows);
                 if !self.overlaid.contains(&id) {
                     self.overlaid.push(id);
                 }
@@ -422,9 +423,6 @@ mod tests {
         assert_eq!(tiles.draw(&mut out, &mut files, solid(60, 56, 9), cols, rows, cell, 2), Some(Drawn::Whole));
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("\x1b_Ga=d,d=I,i=18,q=2\x1b\\\x1b[2;1H\x1b_Ga=T,"), "{text:?}");
-        for path in tiles.last.drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
     }
 
     #[test]

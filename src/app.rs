@@ -249,11 +249,6 @@ struct App {
     help_rect: Option<ui::Rect>,
     /// This kb's number among those running, for `kb ctl -i`.
     instance: u32,
-    /// The logo, until the first page is ready to draw.
-    splash: Option<crate::splash::Splash>,
-    /// Whether a page other than the blank one has been committed, so that
-    /// its frames replace the logo.
-    committed: bool,
     /// When kb started, to turn the loading spinner by.
     started: Instant,
     /// Whether the pane has keyboard focus, as far as the terminal says.
@@ -399,8 +394,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         help: false,
         help_rect: None,
         instance,
-        splash: crate::splash::Splash::new(),
-        committed: false,
         started: Instant::now(),
         focused: true,
         last_input: Instant::now(),
@@ -450,13 +443,10 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
     let result = loop {
         let mut messages = Vec::new();
         // Wake in time to let Chrome send its next frame.
-        let mut wait = match app.chrome.ack_pending() {
+        let wait = match app.chrome.ack_pending() {
             true => app.frame_gap().saturating_sub(app.last_ack.elapsed()).min(TICK),
             false => TICK,
         };
-        if let Some(splash_wait) = app.splash.as_ref().filter(|_| app.by_file).and_then(|splash| splash.wait()) {
-            wait = wait.min(splash_wait);
-        }
         match rx.recv_timeout(wait) {
             Ok(message) => messages.push(message),
             Err(RecvTimeoutError::Timeout) => {}
@@ -546,10 +536,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 }
                 Msg::Term(Event::Graphics { id, ok }) => {
                     log(format_args!("graphics reply for image {id}: {ok}"));
-                    if !ok && app.page.lost(id) {
-                        // The terminal dropped an image the page was drawn
-                        // with: start again from the whole page.
-                        term::write(graphics::DELETE);
+                    if app.page.reply(id, ok) {
                         new_frame = true;
                     }
                     if id == graphics::FILE_QUERY_ID {
@@ -561,6 +548,12 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 }
                 Msg::Term(Event::Focus(focused)) => {
                     log(format_args!("focused: {focused}"));
+                    if focused {
+                        // A reattached client can have the same dimensions but
+                        // no cached graphics. Repaint even if Chrome is idle.
+                        app.page.forget();
+                        new_frame = true;
+                    }
                     app.focused = focused;
                 }
                 Msg::Term(Event::PixelMouse(on)) => {
@@ -627,8 +620,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                             // frame again is nothing to draw.
                             if fits && app.frame.as_deref() != Some(png.as_str()) {
                                 app.frame = Some(png);
-                                // The blank page that comes first stays under the logo.
-                                new_frame = app.splash.is_none() || app.committed;
+                                new_frame = true;
                             }
                         }
                         Some(PageEvent::Url(url)) => {
@@ -662,6 +654,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
 
         if checked.elapsed() >= TICK {
             checked = Instant::now();
+            new_frame |= app.page.expire(checked);
             // The spinner in the bar turns while a page loads.
             redraw |= app.loading;
             app.history.save_if_due();
@@ -692,9 +685,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         if new_frame || redraw {
             app.draw(new_frame);
         }
-        if app.by_file && app.splash.as_ref().is_some_and(|splash| splash.due()) {
-            app.draw_splash();
-        }
         // One frame per gap, or all of them while the page is in use.
         while app.chrome.ack_pending() && app.last_ack.elapsed() >= app.frame_gap() {
             app.chrome.ack();
@@ -704,7 +694,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
     };
     app.history.save();
-    app.page.close();
     app.chrome.close();
     result
 }
@@ -886,7 +875,7 @@ impl App {
                 match (self.by_file, self.png_only) {
                     (true, _) => "by file, changed blocks only".to_owned(),
                     (false, false) => "through the pty, what moved or changed".to_owned(),
-                    (false, true) => "through the pty, whole PNG frames (KB_TRANSFER=png)".to_owned(),
+                    (false, true) => "through the pty, whole PNG frames".to_owned(),
                 },
             ),
             ("agents", format!("kb ctl -i {} ...   (kb ctl --help)", self.instance)),
@@ -915,23 +904,6 @@ impl App {
             }
         }
         all
-    }
-
-    fn draw_splash(&mut self) {
-        let cell = self.cell();
-        let (cols, rows) = (self.window.cols, self.page_rows());
-        let Some(splash) = &mut self.splash else { return };
-        let mut out = b"\x1b[?2026h".to_vec();
-        if self.help {
-            crate::splash::Splash::hide(&mut out);
-        } else {
-            splash.draw(&mut self.page.files, &mut out, cols, rows, cell, 2);
-        }
-        // The splash paints the pane black, help and all.
-        self.help_rect = None;
-        self.render_help(&mut out);
-        out.extend_from_slice(b"\x1b[?2026l");
-        term::write(&out);
     }
 
     /// Draw the help box, if it is open, over whatever is below the bar.
@@ -976,7 +948,6 @@ impl App {
         log(format_args!("url {url}"));
         self.copy_request = CopyRequest::default();
         self.describe_request = None;
-        self.committed |= url != "about:blank";
         self.history.record(&url);
         self.url = if url == "about:blank" { String::new() } else { url };
         // An empty field waiting for an address gives way to
@@ -988,20 +959,8 @@ impl App {
         }
     }
 
-    /// Show the help box, or the panel set for it. The logo, an image,
-    /// would cover it, so it is hidden meanwhile.
-    fn open_help(&mut self) {
-        self.help = true;
-        if let Some(splash) = &mut self.splash {
-            splash.again();
-        }
-    }
-
     fn close_help(&mut self) {
         self.help = false;
-        if let Some(splash) = &mut self.splash {
-            splash.again();
-        }
         if self.panel.take().is_some() {
             self.chrome.evaluate(UNHOVER);
         }
@@ -1066,10 +1025,6 @@ impl App {
         // Synchronized update, so the terminal shows the result in one go.
         let mut out = b"\x1b[?2026h".to_vec();
         let cell = self.cell();
-        let frame = frame && (self.splash.is_none() || self.committed);
-        if frame && self.splash.take().is_some() {
-            crate::splash::Splash::remove(&mut out, 2);
-        }
         if let Some(png) = self.frame.as_deref().filter(|_| frame) {
             let (cols, rows) = self.shown;
             let scaled = self.fixed.is_some();
@@ -1079,6 +1034,10 @@ impl App {
                 (false, true) => Route::Png,
             };
             let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2);
+            if self.page.files_failed {
+                self.by_file = false;
+                self.png_only = true;
+            }
             log(format_args!("drew {drawn}"));
         }
         let cols = self.window.cols as usize;
@@ -1214,7 +1173,7 @@ impl App {
             Action::ZoomIn => self.step_zoom(true),
             Action::ZoomOut => self.step_zoom(false),
             Action::ZoomReset => self.zoom_to_fit(),
-            Action::Help => self.open_help(),
+            Action::Help => self.help = true,
             Action::Copy => {
                 let field = match &self.find {
                     Some(field) => Some(field.text()),
@@ -1317,7 +1276,7 @@ impl App {
             lines.push(String::new());
             lines.push(format!("\t{again} inspects another; any key closes this."));
             self.panel = Some(lines);
-            self.open_help();
+            self.help = true;
             return true;
         }
         false

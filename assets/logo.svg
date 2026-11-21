@@ -1,8 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="380" height="290" viewBox="15 60 380 290">
-  <!-- KittyBrowser: a glass cat head holding a planet, with a tilted ring.
-       src/splash.rs sends a light round the ring and needs its ellipse
-       (centre 197,212, half widths 152 and 38, tilted -15 degrees), the
-       sphere (centre 205,225, radius 100) and this viewBox's origin. -->
+  <!-- KittyBrowser: a glass cat head holding a planet, with a tilted ring. -->
   <defs>
     <linearGradient id="shell" gradientUnits="userSpaceOnUse" x1="95" y1="0" x2="315" y2="0">
       <stop offset="0" stop-color="#d257ff"/>
