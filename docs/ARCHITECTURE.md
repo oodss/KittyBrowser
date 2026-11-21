@@ -154,8 +154,12 @@ on partial updates, kb sends a fresh base once, including for a page that
 has since stopped changing. This repairs a client that lost placements
 after its server acknowledged them.
 
-**Over a network** (`term::layers`). When the terminal can't read files,
-which is always the case over ssh, every byte crosses the link: a whole
+**Over a network** (`term::layers`). Rex uses layers by default because its
+server can read temporary files even when the display is on another machine.
+A refresh transfers the new base before retiring the previous images so a
+slow transfer can keep showing the old frame. `KB_TRANSFER=files` opts into
+the file probe. With layers, every transmitted byte travels through the
+pty, including over SSH. A whole
 2736x1666 frame is about 1.1 MB, and resending it for each scroll step or
 keystroke cost 50 to 70 ms on a LAN. So each frame is decoded and compared
 with the one on screen:

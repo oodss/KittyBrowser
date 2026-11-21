@@ -276,7 +276,8 @@ it's worth knowing before you turn on the MCP server. See
 | `KB_CHROME` | The browser to run, if kb doesn't find one |
 | `KB_CHROME_ARGS` | Extra flags for Chrome, separated by spaces |
 | `KB_SCROLL_STEP` | CSS pixels per wheel or trackpad tick (1–65535, default 32). Try 16 for fine scrolling or 60 for the previous distance. |
-| `KB_TRANSFER=pty` | Always send frames through the terminal, never by file |
+| `KB_TRANSFER=pty` | Reuse and move image layers through the terminal (default in Rex) |
+| `KB_TRANSFER=files` | Probe for temporary-file transfers, including in Rex |
 | `KB_TRANSFER=png` | Through the terminal, and each frame whole as a PNG: for a terminal that shows kb's page broken over ssh |
 | `KB_FORCE` | Start without asking the terminal whether it draws kitty graphics |
 | `KB_HEADLESS_IDLE` | Seconds a headless kb (`kb --headless`) waits for a command before quitting by itself; default 600 |

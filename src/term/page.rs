@@ -42,6 +42,18 @@ pub enum Route {
     Png,
 }
 
+impl Route {
+    pub fn preferred(setting: Option<&str>, rex: bool) -> Self {
+        match setting {
+            Some("png") => Self::Png,
+            Some("pty") => Self::Layers,
+            Some("files") => Self::Files,
+            _ if rex => Self::Layers,
+            _ => Self::Files,
+        }
+    }
+}
+
 /// The ways of drawing the page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Drawer {
@@ -60,6 +72,14 @@ impl PageImage {
         self.first_patch = None;
     }
 
+    /// A focus report can mean the client lost its placements. Rebuild a
+    /// complete base while retaining the IDs needed to retire any survivors.
+    pub fn refresh(&mut self) {
+        self.tiles.refresh();
+        self.layers.refresh();
+        self.first_patch = None;
+    }
+
     /// True when the caller should redraw Chrome's latest frame, including
     /// when a delayed reader has just finished and Chrome is already idle.
     pub fn reply(&mut self, id: u32, ok: bool) -> bool {
@@ -73,8 +93,8 @@ impl PageImage {
                 self.sent = None;
                 return std::mem::take(&mut self.deferred);
             }
-        } else if !ok && self.on_screen == Some(Drawer::Layers) && self.layers.lost(id) {
-            self.forget();
+        } else if !ok && self.on_screen == Some(Drawer::Layers) && self.layers.holds(id) {
+            self.refresh();
             return true;
         }
         false
@@ -94,7 +114,7 @@ impl PageImage {
             return true;
         }
         if self.first_patch.is_some_and(|at| now.duration_since(at) >= PATCH_LIFETIME) {
-            self.forget();
+            self.refresh();
             return true;
         }
         false
@@ -344,6 +364,31 @@ mod tests {
         assert_eq!(screen.page(2, cell, 60, 56), pixels.data);
         assert!(!image.reply(graphics::IMAGE_ID, true));
         assert!(!image.expire(Instant::now() + PATCH_LIFETIME));
+    }
+
+    #[test]
+    fn refresh_places_the_complete_frame_before_retiring_old_images() {
+        for route in [Route::Files, Route::Layers, Route::Png] {
+            let (mut image, mut screen) = (PageImage::default(), Screen::default());
+            shows(&mut image, &mut screen, &page(16, 0), route);
+            shows(&mut image, &mut screen, &page(16, 5), route);
+            image.refresh();
+            let update = shows(&mut image, &mut screen, &page(16, 5), route);
+            let placed = update.find("\x1b_Ga=T").unwrap();
+            assert!(!update[..placed].contains("\x1b_Ga=d"));
+            assert!(!update.contains("a=d,d=A"));
+        }
+    }
+
+    #[test]
+    fn explicit_transfer_choices_override_the_rex_default() {
+        assert_eq!(Route::preferred(None, true), Route::Layers);
+        assert_eq!(Route::preferred(None, false), Route::Files);
+        for rex in [true, false] {
+            for (setting, route) in [("files", Route::Files), ("pty", Route::Layers), ("png", Route::Png)] {
+                assert_eq!(Route::preferred(Some(setting), rex), route);
+            }
+        }
     }
 
     #[test]

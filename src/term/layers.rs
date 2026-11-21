@@ -189,16 +189,8 @@ struct Held {
 type Rows = HashMap<u64, Option<u32>, BuildHasherDefault<Identity>>;
 
 impl Layers {
-    /// The terminal reported an error for image `id`. If it is one of
-    /// these, it was most likely dropped, and the screen is in no known
-    /// state: this forgets it all and returns true, and the caller should
-    /// clear the screen of images and draw the frame again.
-    pub fn lost(&mut self, id: u32) -> bool {
-        let ours = self.held.iter().any(|held| held.id == id);
-        if ours {
-            self.forget();
-        }
-        ours
+    pub fn holds(&self, id: u32) -> bool {
+        self.held.iter().any(|held| held.id == id)
     }
 
     /// The screen was cleared of images: the next draw sends the whole frame.
@@ -206,6 +198,10 @@ impl Layers {
         self.shown = None;
         self.placements.clear();
         self.held.clear();
+    }
+
+    pub fn refresh(&mut self) {
+        self.shown = None;
     }
 
     /// Append the escapes that bring the screen to `png_base64`, one of
@@ -268,11 +264,9 @@ impl Layers {
     /// or two larger than `new` (its cropped copy): only `new`'s part shows.
     fn whole(&mut self, out: &mut Vec<u8>, png_base64: &str, new: &Pixels, page: Page) {
         self.placements.clear();
-        for held in self.held.drain(..) {
-            delete_image(out, held.id);
-        }
-        // Nothing is left, so ids and z start again.
-        (self.next_image, self.next_placement, self.next_z) = (0, 0, BOTTOM_Z);
+        // Reserve a distinct ID while the old images are still held. A
+        // remote display may process this large transfer over several reads.
+        self.next_z = BOTTOM_Z;
         let placement = self.new_placement(Rect { x: 0, y: 0, width: new.width, height: new.height }, &[]);
         page.cursor(out, &placement);
         let keys = format!(
@@ -280,6 +274,9 @@ impl Layers {
             placement.image, placement.id, new.width, new.height, placement.z
         );
         transmit(out, &keys, png_base64);
+        for held in self.held.drain(..) {
+            delete_image(out, held.id);
+        }
         self.placements.push(placement);
         let pixels = Pixels { data: new.data.clone(), ..*new };
         self.held.push(Held { id: placement.image, x: 0, pixels, used: self.clock, rows: Vec::new() });
@@ -347,13 +344,6 @@ impl Layers {
             self.placements.iter().map(|placement| ((placement.image, placement.id), *placement)).collect();
         let after: std::collections::HashSet<(u32, u32)> =
             next.iter().zip(&shows).filter(|(_, &shows)| shows).map(|(p, _)| (p.image, p.id)).collect();
-        for placement in &self.placements {
-            if !after.contains(&(placement.image, placement.id)) {
-                out.extend_from_slice(
-                    format!("\x1b_Ga=d,d=i,i={},p={},q=2\x1b\\", placement.image, placement.id).as_bytes(),
-                );
-            }
-        }
         for (placement, _) in next[..first_sent].iter().zip(&shows).filter(|(_, &shows)| shows) {
             if before.get(&(placement.image, placement.id)) != Some(placement) {
                 page.place(out, placement);
@@ -386,6 +376,14 @@ impl Layers {
             );
             transmit(out, &keys, &crate::base64::encode(&data));
             self.held.push(Held { id: placement.image, x: placement.x, pixels, used: self.clock, rows: Vec::new() });
+        }
+        // Retire old placements only after their replacement pixels arrive.
+        for placement in &self.placements {
+            if !after.contains(&(placement.image, placement.id)) {
+                out.extend_from_slice(
+                    format!("\x1b_Ga=d,d=i,i={},p={},q=2\x1b\\", placement.image, placement.id).as_bytes(),
+                );
+            }
         }
         self.placements = next.into_iter().zip(shows).filter(|(_, shows)| *shows).map(|(p, _)| p).collect();
         self.tidy(out, new.width as u64 * new.height as u64);
@@ -585,8 +583,7 @@ impl Page {
 
     /// Place an image the terminal has, or move a placement of it. An
     /// image that has been gone a while may have been dropped (a terminal
-    /// keeps only so much), so the terminal is asked to say if it has: see
-    /// `Layers::lost`.
+    /// keeps only so much). Request errors so the app can rebuild the base.
     fn place(&self, out: &mut Vec<u8>, placement: &Placement) {
         self.cursor(out, placement);
         let from = placement.from;
