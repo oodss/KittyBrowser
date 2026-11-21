@@ -1244,9 +1244,6 @@ impl App {
             None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
-        if let Some(field) = self.prompt_field() {
-            ui::render_bar(&mut out, field, cols, false, Some("Prompt"), None, (1, 1));
-        }
         out.extend_from_slice(b"\x1b[?2026l");
         out
     }

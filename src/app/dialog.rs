@@ -163,11 +163,11 @@ impl App {
         let rect = ui::render_box(out, &lines, self.window.cols, self.window.rows);
         self.help_rect = Some(rect);
         self.dialogs.rect = Some(rect);
+        let cols = usize::from(self.window.cols);
+        if let Some(dialog) = self.dialogs.pending.get_mut(self.chrome.session()).filter(|d| d.kind == "prompt") {
+            ui::render_bar(out, &mut dialog.field, cols, false, Some("Prompt"), None, (1, 1));
+        }
         true
-    }
-
-    pub(super) fn prompt_field(&mut self) -> Option<&mut AddressBar> {
-        self.dialogs.pending.get_mut(self.chrome.session()).filter(|d| d.kind == "prompt").map(|d| &mut d.field)
     }
 }
 
