@@ -683,14 +683,14 @@ fn browse(
                     app.devtools.command(request, &mut app.chrome, page);
                 }
                 Msg::Chrome(message) => {
-                    if app.picker_event(&message) {
-                        redraw = true;
-                        continue;
-                    }
                     if app.fit_request.is_some() && message["id"].as_u64() == app.fit_request {
                         app.fit_request = None;
                         app.fit(message["result"]["result"]["value"].as_f64());
                         new_frame = true;
+                        continue;
+                    }
+                    if app.picker_event(&message) {
+                        redraw = true;
                         continue;
                     }
                     if let Some(id) = message["id"].as_u64() {
