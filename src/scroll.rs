@@ -1,6 +1,8 @@
 //! Terminals report individual wheel ticks, even for a continuous trackpad gesture.
 
 use crate::term::input::{Mouse, MouseKind};
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // Deliver a single tick immediately. During a burst, send the accumulated
@@ -18,63 +20,120 @@ pub fn step(setting: Option<&str>) -> Result<u16, String> {
     }
 }
 
+// Timestamp at the terminal reader. An old wheel packet must not become
+// young again just because the app loop or Chrome finally caught up.
+pub const MAX_AGE: Duration = Duration::from_millis(120);
+const MAX_TICKS: usize = 8;
+// A healthy Chrome can take several display intervals to acknowledge a wheel.
+// Allow a short pipeline only for the same gesture while replies stay recent.
+const PIPELINE_AGE: Duration = Duration::from_millis(80);
+const WHEEL_SLOTS: usize = 3;
+
+/// A single wakeup covers consecutive motion reports across PTY reads. Taking
+/// the reports and deciding whether the reader needs to notify again share
+/// one lock, so a last movement can never be stranded when the page goes idle.
 #[derive(Default)]
-pub struct WheelScroll {
-    burst: Option<Burst>,
-}
+pub struct Reports(Mutex<VecDeque<(Mouse, Instant)>>);
 
-struct Burst {
-    tick: Mouse,
-    deadline: Instant,
-    extra: i32,
-}
+impl Reports {
+    pub fn push(&self, mouse: Mouse, at: Instant) -> bool {
+        let mut reports = self.0.lock().unwrap();
+        let wake = reports.is_empty();
+        if reports.len() == 32 {
+            reports.pop_front();
+        }
+        reports.push_back((mouse, at));
+        wake
+    }
 
-impl Burst {
-    fn take_extra(&mut self) -> Option<Mouse> {
-        let n = std::mem::take(&mut self.extra);
-        let MouseKind::Wheel(x, y) = self.tick.kind else { unreachable!() };
-        (n > 0).then_some(Mouse { kind: MouseKind::Wheel(x * n, y * n), ..self.tick })
+    pub fn take(&self) -> VecDeque<(Mouse, Instant)> {
+        std::mem::take(&mut *self.0.lock().unwrap())
     }
 }
 
-impl WheelScroll {
-    /// Report an SGR tick (one unit on one axis). Keep separate targets,
-    /// modifiers and axes in order. A reversal at the same target cancels
-    /// unsent motion so the page follows the fingers back immediately.
-    pub fn report(&mut self, tick: Mouse, now: Instant) -> [Option<Mouse>; 2] {
-        let MouseKind::Wheel(x, y) = tick.kind else { unreachable!() };
-        let opposite = Mouse { kind: MouseKind::Wheel(-x, -y), ..tick };
-        let mut previous = None;
-        if let Some(burst) = &mut self.burst {
-            if burst.tick == tick {
-                burst.extra = burst.extra.saturating_add(1);
-                return [self.due(now), None];
-            }
-            if burst.tick != opposite {
-                previous = burst.take_extra();
-            }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    pub kind: MouseKind,
+    pub x: f64,
+    pub y: f64,
+    pub modifiers: u32,
+}
+
+impl Motion {
+    fn same_wheel(self, other: Self) -> bool {
+        matches!(self.kind, MouseKind::Wheel(..)) && self == other
+    }
+}
+
+/// Keep the requests already owned by Chrome separate from the samples that
+/// kb can still replace. Hover and a changed wheel target wait for a reply.
+#[derive(Default)]
+pub struct Lane {
+    requests: VecDeque<(u64, Motion, Instant)>,
+    pending: VecDeque<(Motion, Instant)>,
+    last: Option<(Motion, Instant)>,
+}
+
+impl Lane {
+    pub fn offer(&mut self, event: Motion, at: Instant) {
+        if !self.pending.back().is_some_and(|(previous, _)| previous.same_wheel(event)) {
+            self.pending.clear();
         }
-        self.burst = Some(Burst { tick, deadline: now + INTERVAL, extra: 0 });
-        [previous, Some(tick)]
+        if self.pending.len() == MAX_TICKS {
+            self.pending.pop_front();
+        }
+        self.pending.push_back((event, at));
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+        self.last = None;
     }
 
     pub fn wait(&self, now: Instant) -> Option<Duration> {
-        self.burst.as_ref().filter(|b| b.extra > 0).map(|b| b.deadline.saturating_duration_since(now))
+        let (next, _) = self.pending.front()?;
+        if let Some((_, first, at)) = self.requests.front() {
+            if self.requests.len() >= WHEEL_SLOTS || !first.same_wheel(*next) || now.duration_since(*at) >= PIPELINE_AGE
+            {
+                return None;
+            }
+        }
+        let until = self.last.filter(|(last, _)| last.same_wheel(*next)).map(|(_, at)| at + INTERVAL);
+        Some(until.map_or(Duration::ZERO, |at| at.saturating_duration_since(now)))
     }
 
-    pub fn due(&mut self, now: Instant) -> Option<Mouse> {
-        let burst = self.burst.as_mut()?;
-        if now < burst.deadline {
+    pub fn take(&mut self, now: Instant, flush: bool) -> Option<Motion> {
+        if flush && !self.requests.is_empty() {
             return None;
         }
-        let event = burst.take_extra()?;
-        burst.deadline = now + INTERVAL;
+        let delay = self.wait(now)?;
+        if !flush && !delay.is_zero() {
+            return None;
+        }
+        self.pending.retain(|(event, at)| event.kind == MouseKind::Move || now.duration_since(*at) <= MAX_AGE);
+        let (mut event, _) = *self.pending.back()?;
+        self.last = Some((event, now));
+        if let MouseKind::Wheel(dx, dy) = event.kind {
+            let count = self.pending.len() as i32;
+            event.kind = MouseKind::Wheel(dx * count, dy * count);
+        }
+        self.pending.clear();
         Some(event)
     }
 
-    /// Deliver pending distance before a click, key, or coordinate change.
-    pub fn finish(&mut self) -> Option<Mouse> {
-        self.burst.take()?.take_extra()
+    pub fn sent(&mut self, id: u64) {
+        if id != 0 {
+            let (event, at) = self.last.expect("only a dispatched motion has a request ID");
+            self.requests.push_back((id, event, at));
+        }
+    }
+
+    pub fn reply(&mut self, id: u64) -> bool {
+        let Some(index) = self.requests.iter().position(|(request, _, _)| *request == id) else {
+            return false;
+        };
+        self.requests.remove(index);
+        true
     }
 }
 
@@ -146,48 +205,104 @@ mod tests {
         assert!(!capture.unavailable(active + Duration::from_secs(1)));
     }
 
-    fn down() -> Mouse {
-        Mouse { kind: MouseKind::Wheel(0, 1), button: None, x: 10, y: 20, ctrl: false, alt: false, shift: false }
+    #[test]
+    fn one_reader_wakeup_covers_a_flood_and_the_next_tick_wakes_again() {
+        let reports = Reports::default();
+        let now = Instant::now();
+        let mut mouse =
+            Mouse { kind: MouseKind::Move, button: None, x: 0, y: 1, ctrl: false, alt: false, shift: false };
+        for x in 0..1000 {
+            mouse.x = x;
+            assert_eq!(reports.push(mouse, now), x == 0);
+        }
+        let batch = reports.take();
+        assert_eq!(batch.len(), 32);
+        assert_eq!(batch.back(), Some(&(mouse, now)));
+        assert!(reports.push(mouse, now));
+    }
+
+    fn wheel(dy: i32) -> Motion {
+        Motion { kind: MouseKind::Wheel(0, dy), x: 10., y: 20., modifiers: 0 }
     }
 
     #[test]
-    fn isolated_ticks_are_immediate_and_bursts_preserve_distance_without_a_frame() {
-        let mut scroll = WheelScroll::default();
+    fn fast_input_is_immediate_and_recent_ticks_keep_their_distance() {
+        let mut lane = Lane::default();
         let now = Instant::now();
-        assert_eq!(scroll.report(down(), now), [None, Some(down())]);
-        assert_eq!(scroll.wait(now), None);
-        for _ in 0..12 {
-            assert_eq!(scroll.report(down(), now), [None, None]);
+        lane.offer(wheel(1), now);
+        assert_eq!(lane.take(now, false), Some(wheel(1)));
+        lane.sent(7);
+        for _ in 0..4 {
+            lane.offer(wheel(1), now);
         }
-        assert_eq!(scroll.wait(now), Some(INTERVAL));
-        assert_eq!(scroll.due(now), None);
-        assert_eq!(scroll.due(now + INTERVAL).unwrap().kind, MouseKind::Wheel(0, 12));
-        assert!(scroll.due(now + INTERVAL * 2).is_none());
-        assert_eq!(scroll.report(down(), now + INTERVAL * 3), [Some(down()), None]);
+        assert_eq!(lane.wait(now), Some(INTERVAL));
+        assert!(!lane.reply(8));
+        assert!(lane.reply(7));
+        assert_eq!(lane.wait(now), Some(INTERVAL));
+        assert_eq!(lane.take(now + INTERVAL, false), Some(wheel(4)));
     }
 
     #[test]
-    fn reversal_cancels_only_unsent_ticks_at_the_same_target() {
+    fn stalled_wheel_is_bounded_and_aged_from_each_input_sample() {
+        let mut lane = Lane::default();
         let now = Instant::now();
-        let up = Mouse { kind: MouseKind::Wheel(0, -1), ..down() };
-        let mut scroll = WheelScroll::default();
-        scroll.report(down(), now);
-        scroll.report(down(), now);
-        assert_eq!(scroll.report(up, now), [None, Some(up)]);
-        assert_eq!(scroll.due(now + INTERVAL), None);
-        for next in [
-            Mouse { x: 11, ..down() },
-            Mouse { ctrl: true, ..down() },
-            Mouse { kind: MouseKind::Wheel(1, 0), ..down() },
-        ] {
-            scroll.finish();
-            scroll.report(down(), now);
-            scroll.report(down(), now);
-            assert_eq!(scroll.report(next, now), [Some(down()), Some(next)]);
-            scroll.report(next, now);
-            assert_eq!(scroll.finish(), Some(next));
-            assert_eq!(scroll.wait(now), None);
+        lane.offer(wheel(1), now);
+        lane.take(now, false).unwrap();
+        lane.sent(12);
+        for _ in 0..1000 {
+            lane.offer(wheel(1), now);
         }
+        assert_eq!(lane.pending.len(), MAX_TICKS);
+        let later = now + MAX_AGE + INTERVAL;
+        lane.offer(wheel(1), later);
+        assert!(lane.reply(12));
+        assert_eq!(lane.take(later, false), Some(wheel(1)));
+        lane.sent(13);
+        for event in [wheel(1), wheel(-1), Motion { x: 30., ..wheel(-1) }, Motion { modifiers: 4, ..wheel(-1) }] {
+            lane.offer(event, later);
+            assert_eq!(lane.pending.len(), 1);
+        }
+        lane.clear();
+        assert!(!lane.reply(12));
+        assert!(lane.reply(13));
+        assert_eq!(lane.take(later, true), None);
+    }
+
+    #[test]
+    fn same_target_can_pipeline_but_age_and_capacity_bound_chrome_work() {
+        let mut lane = Lane::default();
+        let start = Instant::now();
+        for i in 0..3 {
+            let at = start + INTERVAL * i;
+            lane.offer(wheel(1), at);
+            assert_eq!(lane.take(at, false), Some(wheel(1)));
+            lane.sent(u64::from(i + 1));
+        }
+        lane.offer(wheel(1), start + 3 * INTERVAL);
+        assert_eq!(lane.wait(start + 3 * INTERVAL), None);
+        assert!(lane.reply(2)); // A later reply cannot freshen the oldest request.
+        assert_eq!(lane.wait(start + PIPELINE_AGE), None);
+        lane.offer(wheel(-1), start + PIPELINE_AGE);
+        assert_eq!(lane.take(start + PIPELINE_AGE, true), None);
+        assert!(lane.reply(1));
+        assert!(lane.reply(3));
+        assert_eq!(lane.take(start + PIPELINE_AGE, false), Some(wheel(-1)));
+    }
+
+    #[test]
+    fn only_the_latest_hover_survives_a_slow_reply() {
+        let mut lane = Lane::default();
+        let now = Instant::now();
+        let hover = Motion { kind: MouseKind::Move, ..wheel(0) };
+        lane.offer(hover, now);
+        lane.take(now, false).unwrap();
+        lane.sent(42);
+        for x in 0..100 {
+            lane.offer(Motion { x: f64::from(x), ..hover }, now);
+        }
+        assert_eq!(lane.take(now, true), None);
+        lane.reply(42);
+        assert_eq!(lane.take(now + MAX_AGE, false), Some(Motion { x: 99., ..hover }));
     }
 
     #[test]

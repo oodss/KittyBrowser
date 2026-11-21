@@ -35,12 +35,25 @@ Cancelling presents the latest frame even if the animation has stopped.
 With Chrome and a release build, `python3 tests/slow-terminal.py` checks
 these transitions and keyboard input during a blocked PTY write.
 
-Rex and other SGR terminals report scrolling as discrete wheel ticks. The
-first tick goes straight to Chrome. At a fixed pointer position, subsequent
-ticks with the same direction and modifiers are combined over 16 ms. The
-timer also drains the last ticks when Chrome is idle. Reversing direction
-discards pending motion in the old direction. Keyboard input, clicks, and
-changes of target or modifiers retain their ordering.
+Rex and other SGR terminals report scrolling as discrete wheel ticks. kb
+timestamps input as it reads the PTY. Consecutive motion reports share one
+app-loop wakeup and retain the latest 32 samples. A click, key, drag or
+terminal reply seals that batch. A single tick goes to Chrome immediately
+when ready. Further ticks at the same position, axis, direction and modifiers
+can be combined over 16 ms. For the same gesture, up to three
+`Input.dispatchMouseEvent` requests can be in flight while the oldest is less
+than 80 ms old. A different gesture waits for the outstanding requests. While
+waiting, kb retains up to eight recent ticks. A reversal or change of target replaces the unsent gesture.
+Samples older than 120 ms are discarded before dispatch. Plain pointer motion
+has a separate slot and retains the latest hover position.
+
+A click, key or paste can proceed while a motion request is outstanding.
+Pending motion is discarded at input and view boundaries. Up to three already submitted
+wheel requests may still complete on the page. Page drags and button transitions are
+delivered in order. The limits cover input from the pane; agent commands keep
+their existing completion semantics. `python3 tests/slow-input.py` exercises
+a blocking wheel handler, a direction reversal and an immediately following
+click and keystroke in real Chrome.
 
 ## Startup
 
