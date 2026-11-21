@@ -54,15 +54,27 @@ A window a page opens, such as a sign-in popup, is shown over the page;
 ‹ › in the bar switch between open windows, and ✕ closes the one shown.
 
 There is no prebuilt release yet, so kb needs Rust to build. Once releases
-are published, this will install kb without Rust:
+are published, install and authenticate the
+[GitHub CLI](https://cli.github.com) (`gh auth login`), then this will install
+kb without Rust:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/oodss/KittyBrowser/main/install.sh | sh
 ```
 
 It puts a prebuilt kb in `~/.local/bin` (`KB_INSTALL_DIR` to put it
-elsewhere). Until then, or on a machine with no prebuilt kb, it builds with
-cargo, so it needs Rust too.
+elsewhere). The installer verifies GitHub's keyless artifact attestation
+against the KittyBrowser repository, release workflow, version tag, source
+commit and archive before unpacking it. It rejects older unsigned releases
+and machines with no prebuilt archive instead of silently building another
+revision; use the Cargo command above when you deliberately want a source
+build. This proves which authorized workflow produced the archive; it does
+not make a compromised authorized runner or toolchain trustworthy.
+
+`KB_REPO=owner/repository` selects a fork only when
+`KB_TRUSTED_REPO=owner/repository` is also set to explicitly trust that
+repository's `.github/workflows/release.yml`. A custom repository is never
+trusted by default.
 
 ## Requirements
 
@@ -73,8 +85,9 @@ cargo, so it needs Rust too.
   screen or Zellij.
 - **Chrome, Chromium, Edge or Brave**, installed where kb can find it, or
   named with `KB_CHROME`.
-- **Rust** (stable, from [rustup](https://rustup.rs)) to build it, until
-  there's a prebuilt release.
+- **Rust 1.95.0** (from [rustup](https://rustup.rs)) to build it. The version
+  in `Cargo.toml` is also the release toolchain version, so updates happen in
+  reviewed repository changes.
 
 `kb doctor` checks the first two. kb itself asks the terminal when it starts,
 and if it can't draw kitty graphics, says so and why instead of showing a
