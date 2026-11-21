@@ -938,9 +938,13 @@ fn is_favicon(url: &str) -> bool {
 }
 
 impl Devtools {
-    pub fn record_answer(&mut self, kind: &str, accept: bool) {
+    pub fn record_answer(&mut self, kind: &str, message: &str, accept: bool, typed: &str) {
         let answer = if accept { "accepted" } else { "dismissed" };
-        self.log(DIALOG, format!("{kind} was {answer}"), String::new());
+        let mut line = format!("{kind} {message:?} was {answer}");
+        if kind == "prompt" && accept {
+            let _ = write!(line, " with {typed:?}");
+        }
+        self.log(DIALOG, line, String::new());
     }
 
     fn park(&mut self, id: u64, pending: Pending) {
@@ -1611,17 +1615,9 @@ impl Devtools {
                 let kind = params["type"].as_str().unwrap_or("dialog");
                 // Refusing a "leave this page?" would trap the browser on it.
                 let accept = !self.dismiss || kind == "beforeunload";
-                let typed = self.prompt_text.as_deref().or(params["defaultPrompt"].as_str()).unwrap_or("");
+                let typed = self.prompt_text.as_deref().or(params["defaultPrompt"].as_str()).unwrap_or("").to_owned();
                 chrome.request("Page.handleJavaScriptDialog", json!({"accept": accept, "promptText": typed}));
-                let mut line = format!(
-                    "{kind} {:?} was {}",
-                    params["message"].as_str().unwrap_or(""),
-                    if accept { "accepted" } else { "dismissed" }
-                );
-                if kind == "prompt" && accept {
-                    let _ = write!(line, " with {typed:?}");
-                }
-                self.log(DIALOG, line, String::new());
+                self.record_answer(kind, params["message"].as_str().unwrap_or(""), accept, &typed);
             }
             "Network.requestWillBeSent" => {
                 let url = params["request"]["url"].as_str().unwrap_or("");

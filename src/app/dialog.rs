@@ -67,7 +67,18 @@ impl App {
             }
             Some("Page.javascriptDialogClosed") => {
                 if let Some(dialog) = self.dialogs.pending.remove(session) {
-                    self.devtools.record_answer(&dialog.kind, params["result"] == true);
+                    let accepted = params["result"] == true;
+                    self.devtools.record_answer(
+                        &dialog.kind,
+                        &dialog.message,
+                        accepted,
+                        params["userInput"].as_str().unwrap_or(""),
+                    );
+                    if dialog.kind == "beforeunload" && !accepted && session == self.chrome.session() {
+                        self.loading = false;
+                        self.bar.blur(&self.url);
+                        self.chrome.cache_for(&self.url);
+                    }
                     true
                 } else {
                     false

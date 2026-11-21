@@ -1185,7 +1185,8 @@ impl App {
     }
 
     fn navigate(&mut self, url: &str) {
-        self.url = url.to_owned();
+        // Keep the committed URL until Chrome confirms the navigation. A site
+        // can still cancel it after the field shows the requested destination.
         self.loading = true;
         self.bar.blur(url);
         self.chrome.navigate(url);
