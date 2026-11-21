@@ -78,9 +78,73 @@ impl WheelScroll {
     }
 }
 
+/// A second tick distinguishes a gesture from a single wheel step. The page
+/// keeps its native CSS viewport throughout; only Chrome's capture size changes.
+#[derive(Default)]
+pub struct ScrollCapture {
+    last_tick: Option<Instant>,
+    pub preview: Option<(u32, u32)>,
+    awaiting_first: Option<Instant>,
+}
+
+impl ScrollCapture {
+    pub fn wheel(&mut self, now: Instant, native: (u32, u32)) -> bool {
+        let previous = self.last_tick.replace(now);
+        if self.preview.is_some()
+            || !previous.is_some_and(|at| now - at <= Duration::from_millis(120))
+            || u64::from(native.0) * u64::from(native.1) < 900_000
+            || native.0.min(native.1) < 4
+        {
+            return false;
+        }
+        self.preview = Some((native.0.div_ceil(2), native.1.div_ceil(2)));
+        self.awaiting_first = Some(now);
+        true
+    }
+
+    pub fn accepts(&self, (width, height): (u32, u32)) -> bool {
+        self.preview.is_some_and(|(w, h)| width.abs_diff(w) <= 2 && height.abs_diff(h) <= 2)
+    }
+
+    pub fn arrived(&mut self) {
+        self.awaiting_first = None;
+    }
+
+    /// Some Chrome/window combinations cannot provide the requested size.
+    /// Return to native capture even if wheel input never stops.
+    pub fn unavailable(&self, now: Instant) -> bool {
+        self.awaiting_first.is_some_and(|since| now - since >= Duration::from_millis(500))
+    }
+
+    pub fn wait(&self, now: Instant) -> Option<Duration> {
+        self.preview?;
+        Some((self.last_tick? + Duration::from_millis(180)).saturating_duration_since(now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_only_during_sustained_large_scrolls() {
+        let mut capture = ScrollCapture::default();
+        let start = Instant::now();
+        let tick = Duration::from_millis(40);
+        assert!(!capture.wheel(start, (800, 600)));
+        assert!(!capture.wheel(start + tick, (800, 600)));
+        assert!(!capture.wheel(start + tick * 8, (1601, 901)));
+        let active = start + tick * 9;
+        assert!(capture.wheel(active, (1601, 901)));
+        assert!(capture.accepts((800, 450)));
+        assert!(!capture.accepts((1601, 901)));
+        assert!(!capture.wheel(active + tick, (1601, 901)));
+        assert_eq!(capture.wait(active + tick * 5), Some(Duration::from_millis(20)));
+        assert_eq!(capture.wait(active + tick * 6), Some(Duration::ZERO));
+        assert!(capture.unavailable(active + Duration::from_secs(1)));
+        capture.arrived();
+        assert!(!capture.unavailable(active + Duration::from_secs(1)));
+    }
 
     fn down() -> Mouse {
         Mouse { kind: MouseKind::Wheel(0, 1), button: None, x: 10, y: 20, ctrl: false, alt: false, shift: false }

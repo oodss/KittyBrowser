@@ -1084,6 +1084,18 @@ impl Chrome {
         self.screencast_with(json!({"format": "png", "everyNthFrame": 1}));
     }
 
+    /// Restart capture without resizing the tab. The first frame of the new
+    /// screencast also restores sharp text when the page has stopped repainting.
+    pub fn scroll_capture(&mut self, size: Option<(u32, u32)>) {
+        self.unacked.clear();
+        self.stop_screencast();
+        if let Some((width, height)) = size {
+            self.screencast_with(json!({"format": "png", "maxWidth": width, "maxHeight": height, "everyNthFrame": 1}));
+        } else {
+            self.start_screencast();
+        }
+    }
+
     /// Start (or restart) the screencast as JPEG at `quality`, 0 to 100.
     pub fn start_screencast_jpeg(&mut self, quality: u32) {
         self.screencast_with(json!({"format": "jpeg", "quality": quality, "everyNthFrame": 1}));

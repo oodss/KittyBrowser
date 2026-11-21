@@ -190,6 +190,12 @@ struct Held {
 type Rows = HashMap<u64, Option<u32>, BuildHasherDefault<Identity>>;
 
 impl Layers {
+    pub fn retire(&self, out: &mut Vec<u8>) {
+        for image in &self.held {
+            delete_image(out, image.id);
+        }
+    }
+
     pub fn holds(&self, id: u32) -> bool {
         self.held.iter().any(|held| held.id == id)
     }
