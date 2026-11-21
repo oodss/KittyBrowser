@@ -13,19 +13,27 @@ terminal ──────────► app ◄──────────
 ```
 
 Two reader threads deliver terminal input and Chrome messages to the main
-loop. The main loop owns browser and renderer state and sends input to
-Chrome. A writer thread sends complete terminal updates in order.
+loop. The main loop forwards input to Chrome, keeps its latest frame and
+snapshots the current toolbar and overlays. A single output worker owns
+the terminal's image history. It decodes the page, computes and compresses
+changed strips, writes the batch and reports completion. At most one draw
+is in flight. Frames superseded during preparation or output never become
+the base for a later delta. File replies and refresh requests reach the
+same worker in order. File-transfer timeouts start after the write.
 
-While a write is in flight, the main loop keeps the latest Chrome frame
-and UI state. It prepares the next delta only after the write completes,
-so a skipped Chrome frame never becomes the base for a partial update.
-Chrome keeps receiving screencast acknowledgements at the usual rate, so
-the final repaint of a page can arrive while the writer is busy. Keyboard
-input, mouse input and control requests remain live. A burst of pointer moves still collapses to the last one. File-transfer
-reply deadlines start after the update has been written. With Chrome and a
-release build installed locally, `python3 tests/slow-terminal.py` exercises
-keyboard input while a PTY has stopped reading and verifies the final PNG
-when the reader resumes.
+In Rex each page update ends with a terminal status query (CSI 5 n).
+A successful PTY write only means the bytes reached the kernel. The reply
+means the Rex terminal has parsed the batch. Until then, kb holds the newest
+Chrome frame and continues sending text UI updates. If the reply takes over
+one second after the write, kb resumes normal writes and stops issuing
+queries for this session. The reply measures progress at the server terminal.
+`python3 tests/rex-backpressure.py` exercises an eight-frame-per-second
+consumer that drains the PTY immediately and delays its terminal replies.
+
+Opening the quit question pauses page painting until the user answers.
+Cancelling presents the latest frame even if the animation has stopped.
+With Chrome and a release build, `python3 tests/slow-terminal.py` checks
+these transitions and keyboard input during a blocked PTY write.
 
 Rex and other SGR terminals report scrolling as discrete wheel ticks. The
 first tick goes straight to Chrome. At a fixed pointer position, subsequent

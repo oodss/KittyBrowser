@@ -4,6 +4,7 @@
 //! only what changed. Row 1 is the top bar, the page image fills the rest.
 
 mod dialog;
+mod render;
 
 use crate::control::{self, Output, Request};
 mod downloads;
@@ -182,7 +183,10 @@ enum Msg {
     /// A command from `kb ctl` or the MCP server.
     Control(Request),
     ChromeClosed,
-    OutputReady,
+    OutputReady {
+        files_failed: bool,
+    },
+    Repaint,
     OutputFailed,
 }
 
@@ -247,8 +251,6 @@ struct App {
     pacing: crate::motion::FramePacing,
     /// Whether the terminal reads frames from temporary files.
     by_file: bool,
-    /// The page's image on the screen.
-    page: PageImage,
     /// Whether frames go through the pty only whole (`KB_TRANSFER=png`).
     png_only: bool,
     /// Browser zoom: 1 is 100%. It scales the device pixels per CSS pixel,
@@ -415,7 +417,6 @@ fn browse(
         frame: None,
         pacing: crate::motion::FramePacing::new(),
         by_file: false,
-        page: Default::default(),
         png_only: false,
         zoom: 1.0,
         fit_request: None,
@@ -454,13 +455,15 @@ fn browse(
         app.note(&format!("~/.kittybrowser/keys {error}"));
     }
     app.layout();
+    let mut page = PageImage::default();
     // Rex can read a server-side file even when the display is remote.
     // Moving existing placements avoids repeatedly forwarding raw page pixels.
     let rex = std::env::var_os("REX_SESSION").is_some() && std::env::var_os("REX_BLOCK").is_some();
+    let mut receipt = if rex { render::Receipt::Ready } else { render::Receipt::Disabled };
     match Route::preferred(std::env::var("KB_TRANSFER").ok().as_deref(), rex) {
         Route::Png => app.png_only = true,
         Route::Layers => {}
-        Route::Files => app.file_probe = graphics::ask_about_files(&mut app.page.files),
+        Route::Files => app.file_probe = graphics::ask_about_files(&mut page.files),
     }
     app.downloads.start(&mut app.chrome);
     app.chrome.hold_acks();
@@ -470,25 +473,19 @@ fn browse(
         Some(url) => app.navigate(&url),
         None => app.bar.focus(),
     }
-    // The initial bar is small. Once the page is streaming, only the writer
-    // touches stdout so a full PTY cannot delay forwarding input to Chrome.
-    term::write(&app.draw(false));
-    let (frames, incoming) = mpsc::sync_channel::<Vec<u8>>(1);
+    let (frames, incoming) = mpsc::channel();
     let writer = std::thread::spawn(move || {
-        for frame in incoming {
-            let mut out = std::io::stdout().lock();
-            if let Err(error) = out.write_all(&frame).and_then(|()| out.flush()) {
-                let _ = written.send(Msg::OutputFailed);
-                return Err(error);
-            }
-            if written.send(Msg::OutputReady).is_err() {
-                break;
-            }
+        let result = render::run(page, incoming, &written);
+        if result.is_err() {
+            let _ = written.send(Msg::OutputFailed);
         }
-        Ok(())
+        result
     });
 
-    let mut writing = false;
+    // A single draw spans preparation and output. While it is in flight,
+    // only app.frame and the dirty flags change, so the next draw is current.
+    frames.send(app.draw(false, false)).map_err(|_| "terminal writer stopped")?;
+    let mut writing = true;
     let (mut new_frame, mut redraw) = (false, false);
 
     let mut wheel = crate::scroll::WheelScroll::default();
@@ -518,7 +515,8 @@ fn browse(
                 Err(RecvTimeoutError::Disconnected) => break Ok(()),
             }
         }
-        messages.extend(rx.try_iter());
+        // A continuously busy page must still yield to wheel and frame deadlines.
+        messages.extend(rx.try_iter().take(128));
 
         let mut quit = None;
         let count = messages.len();
@@ -646,9 +644,7 @@ fn browse(
                 }
                 Msg::Term(Event::Graphics { id, ok }) => {
                     log(format_args!("graphics reply for image {id}: {ok}"));
-                    if app.page.reply(id, ok) {
-                        new_frame = true;
-                    }
+                    let _ = frames.send(render::Command::Reply(id, ok));
                     if id == graphics::FILE_QUERY_ID {
                         if let Some(path) = app.file_probe.take() {
                             app.by_file = ok;
@@ -661,7 +657,7 @@ fn browse(
                     if focused {
                         // A reattached client can have the same dimensions but
                         // no cached graphics. Repaint even if Chrome is idle.
-                        app.page.refresh();
+                        let _ = frames.send(render::Command::Refresh);
                         new_frame = true;
                     }
                     if focused != app.focused {
@@ -669,6 +665,7 @@ fn browse(
                     }
                     app.focused = focused;
                 }
+                Msg::Term(Event::StatusOk) => receipt.received(),
                 Msg::Term(Event::PixelMouse(on)) => {
                     log(format_args!("pixel mouse: {on}"));
                     app.pixel_mouse = on;
@@ -788,9 +785,14 @@ fn browse(
                         None => {}
                     }
                 }
-                Msg::OutputReady => {
+                Msg::Repaint => new_frame = true,
+                Msg::OutputReady { files_failed } => {
+                    receipt.written(Instant::now());
                     writing = false;
-                    app.page.written(Instant::now());
+                    if files_failed {
+                        app.by_file = false;
+                        app.png_only = true;
+                    }
                 }
                 // Join the writer below to collect its error, even if the
                 // terminal closed or the user quit in the same batch.
@@ -810,7 +812,6 @@ fn browse(
 
         if checked.elapsed() >= TICK {
             checked = Instant::now();
-            new_frame |= app.page.expire(checked);
             // The spinner in the bar turns while a page loads.
             redraw |= app.loading;
             app.history.save_if_due();
@@ -851,15 +852,18 @@ fn browse(
             app.clear();
             new_frame = true;
         }
-        // An encoded delta becomes part of the terminal's history. Only build
-        // it when the previous write has finished. While busy, app.frame and
-        // the dirty flags describe the latest view without queueing stale deltas.
-        if !writing && (new_frame || redraw || app.output.any()) {
-            if frames.send(app.draw(new_frame)).is_err() {
+        // Keep the last page visible behind the quit question. A confirmation
+        // should cost one text update even when Chrome is animating underneath.
+        let paint_page = new_frame && !app.asking_quit && receipt.allows_frame(Instant::now());
+        if !writing && (paint_page || redraw || app.output.any()) {
+            let query = paint_page && app.frame.is_some() && receipt.request();
+            if frames.send(app.draw(paint_page, query)).is_err() {
                 break Err("terminal writer stopped".to_owned());
             }
             writing = true;
-            new_frame = false;
+            if paint_page {
+                new_frame = false;
+            }
             redraw = false;
         }
         // Keep receiving Chrome updates while stdout is busy. If we withhold
@@ -875,9 +879,7 @@ fn browse(
     // Finish already-started escapes before restoring the user's terminal or
     // dropping the private files they refer to. Honour a copy just before quit.
     if app.output.clipboard.is_some() {
-        let mut last = Vec::new();
-        app.output.append(&mut last);
-        let _ = frames.send(last);
+        let _ = frames.send(app.draw(false, false));
     }
     drop(frames);
     let joined = writer.join();
@@ -915,7 +917,6 @@ impl App {
     /// again with the next frame.
     fn clear(&mut self) {
         self.output.clear = true;
-        self.page.forget();
         self.help_rect = None;
     }
 
@@ -1236,26 +1237,21 @@ impl App {
         self.chrome.navigate(url);
     }
 
-    fn draw(&mut self, frame: bool) -> Vec<u8> {
-        // Synchronized update, so the terminal shows the result in one go.
-        let mut out = b"\x1b[?2026h".to_vec();
-        self.output.append(&mut out);
-        let cell = self.cell();
-        if let Some(png) = self.frame.as_deref().filter(|_| frame) {
-            let (cols, rows) = self.shown;
-            let scaled = self.fixed.is_some();
-            let route = match (self.by_file, self.png_only) {
+    fn draw(&mut self, paint_page: bool, request_receipt: bool) -> render::Command {
+        let frame = self.frame.as_ref().filter(|_| paint_page).map(|png| render::Frame {
+            png: Arc::clone(png),
+            request_receipt,
+            route: match (self.by_file, self.png_only) {
                 (true, _) => Route::Files,
                 (false, false) => Route::Layers,
                 (false, true) => Route::Png,
-            };
-            let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2 + u16::from(self.tab_strip));
-            if self.page.files_failed {
-                self.by_file = false;
-                self.png_only = true;
-            }
-            log(format_args!("drew {drawn}"));
-        }
+            },
+            scaled: self.fixed.is_some(),
+            cells: self.shown,
+            cell: self.cell(),
+            top: 2 + u16::from(self.tab_strip),
+        });
+        let mut out = Vec::new();
         let cols = self.window.cols as usize;
         let mut badge = String::new();
         if let Some((note, _)) = &self.notice {
@@ -1289,8 +1285,7 @@ impl App {
             None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
-        out.extend_from_slice(b"\x1b[?2026l");
-        out
+        render::Command::Draw { controls: std::mem::take(&mut self.output), frame, overlay: out }
     }
 
     /// Open the find field in the address bar's place.

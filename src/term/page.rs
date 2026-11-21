@@ -108,6 +108,13 @@ impl PageImage {
         }
     }
 
+    pub fn deadline(&self) -> Option<Instant> {
+        [self.sent.map(|at| at + FILE_TIMEOUT), self.first_patch.map(|at| at + PATCH_LIFETIME)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
     pub fn expire(&mut self, now: Instant) -> bool {
         if self.sent.is_some_and(|sent| now.duration_since(sent) >= FILE_TIMEOUT) {
             self.fallback();

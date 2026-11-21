@@ -98,7 +98,23 @@ def check(folder):
         # Discard the rest of the interrupted batch before examining complete frames.
         read_until(master, b"\x1b[?2026l", buffer)
         wait_for_pixel(master, buffer, bytes((22, 200, 19)))
-        subprocess.run([KB, "ctl", "quit"], env=env, check=True, timeout=5, capture_output=True)
+        # A click on the last tab asks for confirmation. Keep changing the
+        # page while the question is up: it must remain a text-only update,
+        # and cancelling must present the latest pixels even after paint stops.
+        os.write(master, b"\x1b[<0;79;1M\x1b[<0;79;1m")
+        read_until(master, b"Quit KittyBrowser?", buffer)
+        read_until(master, b"\x1b[?2026l", buffer)
+        evaluate("paint('blue'), new Promise(resolve => requestAnimationFrame(() => resolve(true)))")
+        # Focus explicitly requests a base repaint, including on a static page.
+        # A key redraws the question so we can inspect the resulting batch.
+        os.write(master, b"\x1b[Ix")
+        question = read_until(master, b"\x1b[?2026l", buffer)
+        assert b"Quit KittyBrowser?" in question and b"\x1b_Ga=T" not in question
+        os.write(master, b"n")
+        wait_for_pixel(master, buffer, bytes((0, 0, 255)))
+        os.write(master, b"\x1b[<0;79;1M\x1b[<0;79;1m")
+        read_until(master, b"Quit KittyBrowser?", buffer)
+        os.write(master, b"y")
         assert process.wait(timeout=5) == 0
     finally:
         os.close(master)
@@ -110,4 +126,4 @@ def check(folder):
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="kb-slow-terminal-") as folder:
         check(Path(folder))
-    print("PASS input during blocked output and final page after draining the terminal")
+    print("PASS input during blocked output, latest page after draining, and responsive quit confirmation")

@@ -357,10 +357,7 @@ impl Layers {
             next[first_sent..].iter().zip(&shows[first_sent..]).filter(|(_, &shows)| shows).map(|(p, _)| p).collect();
         let cuts: Vec<Pixels> =
             sent.iter().map(|piece| cut(new, piece.x, piece.y, piece.from.width, piece.from.height)).collect();
-        let compressed: Vec<Vec<u8>> = std::thread::scope(|scope| {
-            let work: Vec<_> = cuts.iter().map(|cut| scope.spawn(move || compress(&cut.data))).collect();
-            work.into_iter().map(|done| done.join().unwrap_or_default()).collect()
-        });
+        let compressed = compress_strips(&cuts, threads);
         for ((placement, data), pixels) in sent.into_iter().zip(compressed).zip(cuts) {
             page.cursor(out, placement);
             let keys = format!(
@@ -639,6 +636,29 @@ fn compress(data: &[u8]) -> Vec<u8> {
     miniz_oxide::deflate::compress_to_vec_zlib(data, LEVEL)
 }
 
+/// A fragmented animation can change dozens of small strips. Starting a
+/// thread per strip costs more than compression and competes with Chrome
+/// for CPU. Keep short batches on the renderer and share larger batches
+/// across at most the same number of workers used to split large pieces.
+fn compress_strips(cuts: &[Pixels], threads: usize) -> Vec<Vec<u8>> {
+    let pixels: u64 = cuts.iter().map(|cut| u64::from(cut.width) * u64::from(cut.height)).sum();
+    let workers = ((pixels / PIECE) as usize).min(threads).min(cuts.len());
+    let batch = |cuts: &[Pixels]| cuts.iter().map(|cut| compress(&cut.data)).collect::<Vec<_>>();
+    if workers < 2 {
+        return batch(cuts);
+    }
+    std::thread::scope(|scope| {
+        let mut chunks = cuts.chunks(cuts.len().div_ceil(workers));
+        let first = chunks.next().unwrap();
+        let rest: Vec<_> = chunks.map(|cuts| scope.spawn(move || batch(cuts))).collect();
+        let mut compressed = batch(first);
+        for worker in rest {
+            compressed.extend(worker.join().expect("strip compression failed"));
+        }
+        compressed
+    })
+}
+
 /// `width` pixels of row `y` of `pixels`, from column `x`.
 fn line(pixels: &Pixels, x: u32, y: u32, width: u32) -> &[u8] {
     let bytes = if pixels.alpha { 4 } else { 3 };
@@ -862,6 +882,16 @@ pub(crate) mod tests {
             }
         }
         Pixels { width, height, alpha: false, data }
+    }
+
+    #[test]
+    fn compression_keeps_each_strip_with_its_placement() {
+        let strips: Vec<_> = (0..5).map(|i| frame(512, 256, |_, _| i)).collect();
+        let serial = compress_strips(&strips, 1);
+        assert_eq!(compress_strips(&strips, MAX_THREADS), serial);
+        for (compressed, strip) in serial.iter().zip(strips) {
+            assert_eq!(miniz_oxide::inflate::decompress_to_vec_zlib(compressed).unwrap(), strip.data);
+        }
     }
 
     /// A page of distinct rows, 8 pixels wide, `scrolled` pixels down.

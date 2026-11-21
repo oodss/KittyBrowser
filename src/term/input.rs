@@ -90,6 +90,8 @@ pub enum Event {
     },
     /// Reply to the mode 1016 query: whether mouse reports are in pixels.
     PixelMouse(bool),
+    /// Rex has parsed all terminal output preceding a status query (CSI 5 n).
+    StatusOk,
     /// The pane gained or lost keyboard focus.
     Focus(bool),
     /// Reply to a graphics command: the image id it named, and whether the
@@ -265,6 +267,9 @@ fn color_reply(body: &str) -> Option<Event> {
 
 /// Decode a CSI sequence given what lies between `ESC [` and the final byte.
 fn csi(body: &str, last: u8) -> Option<Event> {
+    if body == "0" && last == b'n' {
+        return Some(Event::StatusOk);
+    }
     if let Some(report) = body.strip_prefix('<') {
         return mouse(report, last == b'M');
     }
@@ -474,6 +479,7 @@ mod tests {
         assert_eq!(parse(b"\x1b[6;34;16t"), [Event::CellSize { width: 16, height: 34 }]);
         assert_eq!(parse(b"\x1b[?1016;1$y"), [Event::PixelMouse(true)]);
         assert_eq!(parse(b"\x1b[?1016;0$y"), [Event::PixelMouse(false)]);
+        assert_eq!(parse(b"\x1b[0n"), [Event::StatusOk]);
         assert_eq!(parse(b"\x1b[I\x1b[O"), [Event::Focus(true), Event::Focus(false)]);
         assert_eq!(parse(b"\x1b[?1u"), []);
         let cmd_l = Key { cmd: true, ..Key::plain(KeyCode::Char('l')) };
