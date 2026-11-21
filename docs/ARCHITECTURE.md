@@ -222,13 +222,17 @@ when Chrome answers each change. And macOS keeps windows at least 500
 wide, so a narrower viewport comes in frames 500 wide, holding the page in
 their top left; kb cuts those to the viewport (`Window::crop`).
 
-**Pacing** (`App::frame_gap`). Chrome sends a frame, then waits for it to be
-acknowledged; kb decides when. While the page is in use (a key, the mouse,
-or a command in the last half second) every frame is acknowledged at once.
-After that one is acknowledged every 100 ms, or every 500 ms when the
-terminal reports the pane has lost focus (mode 1004). Chrome keeps count of
-unacknowledged frames and stops for good if one is never acknowledged, so
-they are queued and each is answered.
+**Pacing** (`App::frame_gap`). A focused pane acknowledges frames immediately
+for half a second after input. Once input stops, the usual limit is 10 fps.
+Sustained visible motion raises the target to 24 fps. A worker samples a
+32 × 24 grid from a changed frame at most four times per second. At least
+eight points must change appreciably in two successive comparisons, so a
+blinking caret or a single repaint leaves the normal limit in place. The
+higher rate expires one second after the last qualifying sample. A static
+page schedules no probes. Losing focus immediately sets a 2 fps limit and
+clears motion history. Navigation and viewport changes also clear that history.
+Chrome keeps count of unacknowledged frames, so kb queues and answers each
+acknowledgement even when terminal output is busy.
 
 Measured on a Wikipedia article at rest, where a 36-pixel dot pulses for
 ever in the toolbar: before, 49 frames a second, each redrawn whole, and

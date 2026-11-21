@@ -16,7 +16,7 @@ use crate::ui::{self, AddressBar, Edit, Hit};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub struct Options {
@@ -188,6 +188,7 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const ACTIVE: Duration = Duration::from_millis(500);
 /// The least time between frames when the page isn't in use, and when the
 /// pane doesn't have focus either.
+const MEDIA_GAP: Duration = Duration::from_nanos(1_000_000_000 / 24);
 const IDLE_GAP: Duration = Duration::from_millis(100);
 const UNFOCUSED_GAP: Duration = Duration::from_millis(500);
 /// Cell size to assume, in device pixels, until the terminal tells us.
@@ -234,7 +235,8 @@ struct App {
     url: String,
     loading: bool,
     /// The newest frame, kept to redraw at a new size.
-    frame: Option<String>,
+    frame: Option<Arc<String>>,
+    pacing: crate::motion::FramePacing,
     /// Whether the terminal reads frames from temporary files.
     by_file: bool,
     /// The page's image on the screen.
@@ -398,6 +400,7 @@ fn browse(
         url: String::new(),
         loading: false,
         frame: None,
+        pacing: crate::motion::FramePacing::new(),
         by_file: false,
         page: Default::default(),
         png_only: false,
@@ -609,6 +612,9 @@ fn browse(
                         app.page.forget();
                         new_frame = true;
                     }
+                    if focused != app.focused {
+                        app.pacing.reset();
+                    }
                     app.focused = focused;
                 }
                 Msg::Term(Event::PixelMouse(on)) => {
@@ -673,8 +679,12 @@ fn browse(
                             // stretched to fill the pane: wait for the right one.
                             // Some pages repaint without changing: the same
                             // frame again is nothing to draw.
-                            if fits && app.frame.as_deref() != Some(png.as_str()) {
-                                app.frame = Some(png);
+                            if fits && app.frame.as_deref() != Some(&png) {
+                                let frame = Arc::new(png);
+                                if app.focused && app.last_input.elapsed() >= ACTIVE {
+                                    app.pacing.frame(&frame, Instant::now());
+                                }
+                                app.frame = Some(frame);
                                 new_frame = true;
                             }
                         }
@@ -798,17 +808,16 @@ impl App {
         }
     }
 
-    /// The least time between frames from Chrome. None while someone is
-    /// using the page; otherwise a page that moves by itself gets ten frames
-    /// a second, or two if the pane isn't the one in use, and Chrome is
-    /// spared drawing and encoding the rest.
+    /// Pacing the acknowledgements lets Chrome skip work between frames.
     fn frame_gap(&self) -> Duration {
-        if self.last_input.elapsed() < ACTIVE {
-            Duration::ZERO
-        } else if self.focused {
-            IDLE_GAP
-        } else {
+        if !self.focused {
             UNFOCUSED_GAP
+        } else if self.last_input.elapsed() < ACTIVE {
+            Duration::ZERO
+        } else if self.pacing.moving(Instant::now()) {
+            MEDIA_GAP
+        } else {
+            IDLE_GAP
         }
     }
 
@@ -861,7 +870,11 @@ impl App {
             "window {:?}, cell {cell_w}x{cell_h} (reported {:?}), viewport {width}x{height}, shown in {:?} cells",
             self.window, self.reported_cell, self.shown
         ));
-        self.viewport = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+        let viewport = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+        if viewport != self.viewport {
+            self.pacing.reset();
+        }
+        self.viewport = viewport;
         if self.frame.as_deref().is_some_and(|png| !self.fits(png)) {
             self.frame = None;
         }
@@ -1034,6 +1047,7 @@ impl App {
     /// The page shown is at `url` now.
     fn went_to(&mut self, url: String) {
         log(format_args!("url {url}"));
+        self.pacing.reset();
         self.copy_request = CopyRequest::default();
         self.describe_request = None;
         self.history.record(&url);
