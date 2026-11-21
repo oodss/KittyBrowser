@@ -90,7 +90,35 @@ pub struct Chrome {
     /// reply to the last change to the window, after which it is started
     /// again: on a Mac, frames stop when the window changes, until then.
     screencast: Option<Value>,
+    capture_start: CaptureStart,
     window_reply: Option<u64>,
+}
+
+/// During a navigation Chrome can accept input and temporarily reject frame
+/// capture. Only the reply to the latest start describes the current tab and
+/// capture size. A quiet, static page with a successful start needs no retry.
+#[derive(Default)]
+struct CaptureStart {
+    request: Option<u64>,
+    retry_at: Option<Instant>,
+    failures: u32,
+}
+
+impl CaptureStart {
+    fn reply(&mut self, id: u64, message: &Value, now: Instant) -> bool {
+        if self.request != Some(id) {
+            return false;
+        }
+        self.request = None;
+        if message["error"]["message"] == "Not attached to an active page" {
+            let delay = Duration::from_millis(100 << self.failures.min(4));
+            self.failures = self.failures.saturating_add(1);
+            self.retry_at = Some(now + delay);
+        } else {
+            *self = Self::default();
+        }
+        true
+    }
 }
 
 /// Chrome's headless window. Frames are usually the size of the viewport
@@ -539,6 +567,7 @@ impl Chrome {
             devtools,
             viewport: None,
             screencast: None,
+            capture_start: CaptureStart::default(),
             window_reply: None,
         };
         Ok((chrome, rx))
@@ -647,15 +676,18 @@ impl Chrome {
     pub fn handle(&mut self, mut message: Value) -> Option<PageEvent> {
         if message["id"].as_u64().is_some_and(|id| self.window_reply == Some(id)) {
             self.window_reply = None;
-            if let Some(params) = self.screencast.clone() {
+            if self.screencast.is_some() {
                 // Frames from before need no acknowledging once it stops.
                 self.unacked.clear();
                 self.send("Page.stopScreencast", json!({}));
-                self.send("Page.startScreencast", params);
+                self.start_capture();
             }
             return None;
         }
         if let Some(id) = message["id"].as_u64() {
+            if self.capture_start.reply(id, &message, Instant::now()) {
+                return None;
+            }
             if self.history_request == Some(id) {
                 self.history_request = None;
                 self.back_from(&message["result"]);
@@ -835,9 +867,7 @@ impl Chrome {
         self.history_request = None;
         let url = self.tabs[at].url.clone();
         self.cache_for(&url);
-        if let Some(params) = self.screencast.clone() {
-            self.send("Page.startScreencast", params);
-        }
+        self.start_capture();
         Some(PageEvent::Shown(self.tabs[at].url.clone()))
     }
 
@@ -1102,8 +1132,31 @@ impl Chrome {
     }
 
     fn screencast_with(&mut self, params: Value) {
-        self.screencast = Some(params.clone());
-        self.send("Page.startScreencast", params);
+        self.screencast = Some(params);
+        self.start_capture();
+    }
+
+    fn start_capture(&mut self) {
+        self.capture_start = CaptureStart::default();
+        self.send_capture_start();
+    }
+
+    fn send_capture_start(&mut self) {
+        if let Some(params) = self.screencast.clone() {
+            self.capture_start.request =
+                self.tx.send("Page.startScreencast", params, Some(&self.tabs[self.shown].session)).ok();
+        }
+    }
+
+    pub fn capture_retry_at(&self) -> Option<Instant> {
+        self.capture_start.retry_at
+    }
+
+    pub fn retry_capture_if_due(&mut self) {
+        if self.capture_start.retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.capture_start.retry_at = None;
+            self.send_capture_start();
+        }
     }
 
     /// Leave each frame unacknowledged until `ack` is called. Chrome sends
@@ -1128,6 +1181,7 @@ impl Chrome {
 
     pub fn stop_screencast(&mut self) {
         self.screencast = None;
+        self.capture_start = CaptureStart::default();
         self.send("Page.stopScreencast", json!({}));
     }
 
@@ -1283,6 +1337,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_a_current_inactive_page_failure_retries_capture() {
+        let now = Instant::now();
+        let inactive = json!({"error": {"message": "Not attached to an active page"}});
+        let mut start = CaptureStart { request: Some(11), ..Default::default() };
+        assert!(!start.reply(10, &inactive, now));
+        assert_eq!(start.retry_at, None);
+        for attempt in 0..7 {
+            start.retry_at = None;
+            start.request = Some(11 + attempt);
+            assert!(start.reply(11 + attempt, &inactive, now));
+            assert_eq!(start.retry_at, Some(now + Duration::from_millis((100 << attempt).min(1600))));
+        }
+        for reply in [json!({"result": {}}), json!({"error": {"message": "Invalid parameters"}})] {
+            start.request = Some(30);
+            assert!(start.reply(30, &reply, now));
+            assert_eq!(start.retry_at, None);
+            assert_eq!(start.failures, 0);
+        }
+    }
 
     #[test]
     fn browsers_named_by_the_user() {
