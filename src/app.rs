@@ -249,10 +249,7 @@ struct App {
     /// The newest frame, kept to redraw at a new size.
     frame: Option<Arc<String>>,
     pacing: crate::motion::FramePacing,
-    /// Whether the terminal reads frames from temporary files.
-    by_file: bool,
-    /// Whether frames go through the pty only whole (`KB_TRANSFER=png`).
-    png_only: bool,
+    route: Route,
     /// Browser zoom: 1 is 100%. It scales the device pixels per CSS pixel,
     /// so the page reflows as in a desktop browser and stays sharp.
     zoom: f64,
@@ -416,8 +413,7 @@ fn browse(
         loading: false,
         frame: None,
         pacing: crate::motion::FramePacing::new(),
-        by_file: false,
-        png_only: false,
+        route: Route::Layers,
         zoom: 1.0,
         fit_request: None,
         help: false,
@@ -460,10 +456,10 @@ fn browse(
     // Moving existing placements avoids repeatedly forwarding raw page pixels.
     let rex = std::env::var_os("REX_SESSION").is_some() && std::env::var_os("REX_BLOCK").is_some();
     let mut receipt = if rex { render::Receipt::Ready } else { render::Receipt::Disabled };
-    match Route::preferred(std::env::var("KB_TRANSFER").ok().as_deref(), rex) {
-        Route::Png => app.png_only = true,
-        Route::Layers => {}
-        Route::Files => app.file_probe = graphics::ask_about_files(&mut page.files),
+    let preferred = Route::preferred(std::env::var("KB_TRANSFER").ok().as_deref(), rex);
+    match preferred {
+        Route::Files | Route::LayerFiles => app.file_probe = graphics::ask_about_files(&mut page.files),
+        route => app.route = route,
     }
     app.downloads.start(&mut app.chrome);
     app.chrome.hold_acks();
@@ -647,7 +643,9 @@ fn browse(
                     let _ = frames.send(render::Command::Reply(id, ok));
                     if id == graphics::FILE_QUERY_ID {
                         if let Some(path) = app.file_probe.take() {
-                            app.by_file = ok;
+                            if ok {
+                                app.route = preferred;
+                            }
                             let _ = std::fs::remove_file(path);
                         }
                     }
@@ -790,8 +788,7 @@ fn browse(
                     receipt.written(Instant::now());
                     writing = false;
                     if files_failed {
-                        app.by_file = false;
-                        app.png_only = true;
+                        app.route = app.route.without_files();
                     }
                 }
                 // Join the writer below to collect its error, even if the
@@ -1067,11 +1064,13 @@ impl App {
             ("pane", format!("{}x{} cells of {cell_w}x{cell_h} pixels", self.window.cols, self.window.rows)),
             (
                 "frames",
-                match (self.by_file, self.png_only) {
-                    (true, _) => "by file, changed blocks only".to_owned(),
-                    (false, false) => "through the pty, what moved or changed".to_owned(),
-                    (false, true) => "through the pty, whole PNG frames".to_owned(),
-                },
+                match self.route {
+                    Route::Files => "by file, changed blocks only",
+                    Route::Layers => "through the pty, what moved or changed",
+                    Route::LayerFiles => "moved layers, large images by server file",
+                    Route::Png => "through the pty, whole PNG frames",
+                }
+                .to_owned(),
             ),
             ("agents", format!("kb ctl -i {} ...   (kb ctl --help)", self.instance)),
             ("trouble", "kb doctor checks the terminal and Chrome".to_owned()),
@@ -1241,11 +1240,7 @@ impl App {
         let frame = self.frame.as_ref().filter(|_| paint_page).map(|png| render::Frame {
             png: Arc::clone(png),
             request_receipt,
-            route: match (self.by_file, self.png_only) {
-                (true, _) => Route::Files,
-                (false, false) => Route::Layers,
-                (false, true) => Route::Png,
-            },
+            route: self.route,
             scaled: self.fixed.is_some(),
             cells: self.shown,
             cell: self.cell(),

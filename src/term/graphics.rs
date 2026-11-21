@@ -30,11 +30,21 @@ const TILE_ROWS: u16 = 6;
 
 /// The protocol's limit on the payload of one escape.
 const CHUNK: usize = 4096;
+const MIN_FILE_BYTES: usize = 32 * 1024;
 
 /// Append the escapes that draw `png_base64` at the cursor, scaled to fill
-/// `cols` x `rows` cells. The cursor doesn't move.
-pub fn put_png(out: &mut Vec<u8>, png_base64: &str, cols: u16, rows: u16) {
-    transmit(out, &format!("a=T,f=100,i={IMAGE_ID},p=1,z={PAGE_Z},q=2,C=1,c={cols},r={rows}"), png_base64);
+/// `cols` x `rows` cells. Returns whether the PNG went by temporary file.
+pub fn put_png(out: &mut Vec<u8>, png_base64: &str, cols: u16, rows: u16, files: Option<&mut FrameFiles>) -> bool {
+    let keys = format!("a=T,f=100,i={IMAGE_ID},p=1,z={PAGE_Z},C=1,c={cols},r={rows}");
+    if let Some(files) = files.filter(|_| png_base64.len() >= MIN_FILE_BYTES.div_ceil(3) * 4) {
+        if let Some(bytes) = crate::base64::decode(png_base64) {
+            if large_image_file(out, Some(files), IMAGE_ID, &keys, &bytes) {
+                return true;
+            }
+        }
+    }
+    transmit(out, &format!("{keys},q=2"), png_base64);
+    false
 }
 
 /// Append `base64` as an image, in escapes of at most `CHUNK` bytes, the
@@ -136,6 +146,27 @@ impl FrameFiles {
     pub fn finish_batch(&mut self) {
         self.pending.clear();
     }
+}
+
+/// Keep short layer updates inline. For a large image the PTY has to copy
+/// and parse many base64 chunks before it can take the next frame. A Rex
+/// server that passed the file probe can read the same encoded bytes locally.
+pub(super) fn large_image_file(
+    out: &mut Vec<u8>,
+    files: Option<&mut FrameFiles>,
+    id: u32,
+    keys: &str,
+    data: &[u8],
+) -> bool {
+    if data.len() < MIN_FILE_BYTES {
+        return false;
+    }
+    let Some(path) = files.and_then(|files| files.page_file(id, data).ok()) else {
+        return false;
+    };
+    let name = crate::base64::encode(path.as_os_str().as_encoded_bytes());
+    out.extend_from_slice(format!("\x1b_G{keys},t=t,q=0;{name}\x1b\\").as_bytes());
+    true
 }
 
 /// Append the escape that draws the pixels saved at `path` in the private directory
@@ -373,13 +404,13 @@ mod tests {
 
     fn put(data: &str) -> String {
         let mut out = Vec::new();
-        put_png(&mut out, data, 80, 23);
+        put_png(&mut out, data, 80, 23, None);
         String::from_utf8(out).unwrap()
     }
 
     #[test]
     fn small_image_is_one_escape() {
-        assert_eq!(put("QUJD"), "\x1b_Ga=T,f=100,i=1,p=1,z=-1073741826,q=2,C=1,c=80,r=23,m=0;QUJD\x1b\\");
+        assert_eq!(put("QUJD"), "\x1b_Ga=T,f=100,i=1,p=1,z=-1073741826,C=1,c=80,r=23,q=2,m=0;QUJD\x1b\\");
     }
 
     #[test]
