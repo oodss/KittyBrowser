@@ -282,10 +282,7 @@ for `scrollWidth`; if that is wider than the viewport it zooms out to fit.
 The page and its tiles are placed with a z-index below -1,073,741,824, which
 the protocol defines as under text and under cells with a background colour
 of their own. So the help box (Ctrl+/) is ordinary coloured text drawn over
-the page, and blanking its cells shows the page again. The startup logo
-(`splash.rs`) is a separate image above the page, animated by sending a new
-frame every 60 ms for 12 seconds; the light's path is the ring's ellipse,
-measured from the logo, dimmed where it passes behind the sphere.
+the page, and blanking its cells shows the page again.
 
 Find (Command+F) puts a second such field in the address bar's place; each
 change runs `window.find` in the page, which selects the match and scrolls

@@ -17,7 +17,6 @@ mod history;
 mod keys;
 mod mcp;
 mod skill;
-mod splash;
 mod term;
 mod ui;
 

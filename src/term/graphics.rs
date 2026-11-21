@@ -70,9 +70,7 @@ pub struct Pixels {
 pub fn decode_png(bytes: &[u8], mut data: Vec<u8>) -> Option<Pixels> {
     // png 0.18 reads from anything that can seek, so a slice goes in a cursor.
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    // Frames come from Chrome over a pipe and the logo is built in, neither
-    // off a disk or a network: checking checksums is a tenth of the time
-    // for nothing.
+    // Chrome supplies these frames over a pipe; skip the redundant checksum pass.
     decoder.ignore_checksums(true);
     let mut reader = decoder.read_info().ok()?;
     data.resize(reader.output_buffer_size()?, 0);
@@ -147,12 +145,6 @@ pub fn put_file(out: &mut Vec<u8>, path: &std::path::Path, pixels: &Pixels, cols
     put_raw_file(out, path, (pixels.width, pixels.height), pixels.alpha, IMAGE_ID, PAGE_Z, cols, rows);
 }
 
-/// Append the escape that draws the pixels saved at `path` at the cursor,
-/// as image `id`, filling `cols` x `rows` cells, above the page.
-pub fn put_image_file(out: &mut Vec<u8>, path: &std::path::Path, pixels: &Pixels, id: u32, cols: u16, rows: u16) {
-    put_raw_file(out, path, (pixels.width, pixels.height), pixels.alpha, id, 0, cols, rows);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn put_raw_file(
     out: &mut Vec<u8>,
@@ -164,15 +156,12 @@ fn put_raw_file(
     cols: u16,
     rows: u16,
 ) {
-    // Page transfers keep their files until the terminal replies. The splash
-    // has its own short-lived images and needs no acknowledgements.
-    let quiet = if z == 0 { 2 } else { 0 };
     let format = if alpha { 32 } else { 24 };
     let name = crate::base64::encode(path.as_os_str().as_encoded_bytes());
     let (width, height) = size;
     out.extend_from_slice(
         format!(
-            "\x1b_Ga=T,f={format},s={width},v={height},t=t,i={id},p=1,z={z},q={quiet},C=1,c={cols},r={rows};{name}\x1b\\"
+            "\x1b_Ga=T,f={format},s={width},v={height},t=t,i={id},p=1,z={z},q=0,C=1,c={cols},r={rows};{name}\x1b\\"
         )
         .as_bytes(),
     );
