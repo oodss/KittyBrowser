@@ -201,6 +201,7 @@ change at once.
 - **Address completion** comes from pages you have visited, kept in
   `~/.kittybrowser/history`. Nothing you type is sent to a suggestion
   service.
+- **File attachments** use files on the browser host. Click a website’s file input, enter a path and press Enter, or click a file in the directory list. For multiple files, select each and click Review (F2). Check the paths, then click Attach or press Enter. Esc cancels.
 - **Cookies and logins** are kept in `~/.kittybrowser/profile`, separate from
   your everyday Chrome.
 - **Several kbs** can run at once, one per pane, and `kb list` numbers them.

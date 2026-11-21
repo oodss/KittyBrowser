@@ -6,6 +6,8 @@
 use crate::control::{self, Output, Request};
 use crate::devtools::{Devtools, Page};
 use crate::engine::chrome::{self, Chrome, PageEvent};
+mod file_picker;
+
 use crate::history::History;
 use crate::keys::{Action, Bindings};
 use crate::term::input::{Button, Event, Key, KeyCode, Mouse, MouseKind, Parser};
@@ -220,6 +222,7 @@ struct App {
     bar: AddressBar,
     /// The find field, while it is open in the address bar's place.
     find: Option<AddressBar>,
+    picker: Option<file_picker::Picker>,
     /// What was last searched for, offered again next time.
     find_text: String,
     history: History,
@@ -393,6 +396,7 @@ fn browse(
         pixel_mouse: false,
         bar: AddressBar::default(),
         find: None,
+        picker: None,
         find_text: String::new(),
         history: History::load(crate::data_dir()?.join("history")),
         devtools: Devtools::default(),
@@ -451,6 +455,7 @@ fn browse(
         Route::Files => app.file_probe = graphics::ask_about_files(&mut app.page.files),
     }
     app.chrome.hold_acks();
+    app.chrome.intercept_files();
     app.chrome.start_screencast();
     match options.url.as_deref().and_then(ui::normalize_url) {
         Some(url) => app.navigate(&url),
@@ -515,6 +520,12 @@ fn browse(
         }
         let mut messages = messages.into_iter().enumerate().peekable();
         while let Some((index, message)) = messages.next() {
+            if let Msg::Term(event) = &message {
+                if app.picker_input(event) {
+                    redraw = true;
+                    continue;
+                }
+            }
             if (app.opening_tab.is_some() || !tab_input.is_empty())
                 && matches!(message, Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_)))
             {
@@ -672,6 +683,10 @@ fn browse(
                     app.devtools.command(request, &mut app.chrome, page);
                 }
                 Msg::Chrome(message) => {
+                    if app.picker_event(&message) {
+                        redraw = true;
+                        continue;
+                    }
                     if app.fit_request.is_some() && message["id"].as_u64() == app.fit_request {
                         app.fit_request = None;
                         app.fit(message["result"]["result"]["value"].as_f64());
@@ -1056,6 +1071,13 @@ impl App {
 
     /// Draw the help box, if it is open, over whatever is below the bar.
     fn render_help(&mut self, out: &mut Vec<u8>) {
+        if let Some(picker) = self.picker.as_mut() {
+            if let Some(old) = self.help_rect.take() {
+                ui::blank(out, old);
+            }
+            self.help_rect = Some(picker.draw(out, self.window));
+            return;
+        }
         if let Some(old) = self.help_rect.take() {
             ui::blank(out, old);
         }
@@ -1071,6 +1093,7 @@ impl App {
     /// Another window is shown, at `url`. Whether it is loading comes in
     /// its own events.
     fn shown(&mut self, url: String) {
+        self.picker = None;
         self.loading = false;
         self.find = None;
         self.buttons = 0;
