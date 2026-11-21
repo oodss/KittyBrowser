@@ -360,8 +360,7 @@ also watches every event to keep what the commands report on:
   the action, with any console errors and dialogs it caused; if it started a
   page load, they wait for that instead. `click`, `hover` and `type` hit-test
   first and refuse an element that is off screen or covered.
-- **Dialogs.** `alert`, `confirm` and `prompt` are answered at once, since an
-  open dialog freezes the page, and recorded in the console.
+- **Dialogs.** `alert`, `confirm` and `prompt` wait for a response in the interactive pane, as does `beforeunload`. Each response is sent to the session that opened the dialog. Headless sessions and explicitly configured automation answer immediately.
 
 `viewport` is the one command the app handles itself: it fixes the layout
 size, and the image is then placed in fewer cells, shrunk to fit if need be,

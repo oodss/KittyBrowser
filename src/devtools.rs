@@ -748,6 +748,7 @@ pub struct Devtools {
     sheets: HashMap<String, (String, u64, bool)>,
     /// How dialogs are answered: dismissed if set, else accepted, and with
     /// this text typed into prompts if given.
+    pub automatic_dialogs: bool,
     dismiss: bool,
     prompt_text: Option<String>,
 }
@@ -937,6 +938,11 @@ fn is_favicon(url: &str) -> bool {
 }
 
 impl Devtools {
+    pub fn record_answer(&mut self, kind: &str, accept: bool) {
+        let answer = if accept { "accepted" } else { "dismissed" };
+        self.log(DIALOG, format!("{kind} was {answer}"), String::new());
+    }
+
     fn park(&mut self, id: u64, pending: Pending) {
         self.pending.insert(id, (pending, Instant::now() + REQUEST_TIMEOUT));
     }
@@ -1356,6 +1362,7 @@ impl Devtools {
                         "dismiss" => true,
                         other => return Err(format!("dialog takes accept or dismiss, not {other:?}")),
                     };
+                    self.automatic_dialogs = true;
                     self.prompt_text = arg("text").map(str::to_owned);
                     let answer = if self.dismiss { "dismissed" } else { "accepted" };
                     text(&reply, format!("dialogs will be {answer} from now on"));
