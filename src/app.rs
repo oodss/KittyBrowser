@@ -180,8 +180,6 @@ enum Msg {
 
 /// How often to check whether the pane changed size.
 const TICK: Duration = Duration::from_millis(100);
-/// CSS pixels scrolled per wheel tick.
-const WHEEL_STEP: f64 = 60.0;
 /// Presses this close in time and place count as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How long after the last key, click or command the page counts as in use.
@@ -207,6 +205,7 @@ fn log(line: std::fmt::Arguments) {
 }
 
 struct App {
+    wheel_step: f64,
     chrome: Chrome,
     scale: f64,
     window: Window,
@@ -294,6 +293,7 @@ pub fn run(options: Options) -> Result<(), String> {
     crate::engine::chrome::find_binary().map_err(|why| format!("{why}\nkb doctor checks your setup."))?;
     // Before anything is written to the terminal: a failure after that
     // leaves the terminal's replies to our queries for the shell to read.
+    let wheel_step = crate::scroll::step(std::env::var("KB_SCROLL_STEP").ok().as_deref())?;
     let claim = control::claim()?;
     let profile = profile(claim.instance)?;
     let window = size::window().ok_or("can't read the terminal size")?;
@@ -314,7 +314,7 @@ pub fn run(options: Options) -> Result<(), String> {
         hook(info);
     }));
     let socket = claim.socket.clone();
-    let result = browse(options, &profile, window, claim);
+    let result = browse(options, &profile, window, claim, wheel_step);
     let _ = std::fs::remove_file(socket);
     term::leave();
     result
@@ -332,7 +332,13 @@ pub fn profile(instance: u32) -> Result<std::path::PathBuf, String> {
     Ok(profile)
 }
 
-fn browse(options: Options, profile: &std::path::Path, window: Window, claim: control::Claim) -> Result<(), String> {
+fn browse(
+    options: Options,
+    profile: &std::path::Path,
+    window: Window,
+    claim: control::Claim,
+    wheel_step: u16,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let instance = claim.instance;
     let commands = tx.clone();
@@ -370,6 +376,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
     });
 
     let mut app = App {
+        wheel_step: f64::from(wheel_step),
         chrome,
         scale: options.scale,
         window,
@@ -439,6 +446,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
     }
     app.draw(false);
 
+    let mut wheel = crate::scroll::WheelScroll::default();
     let mut checked = Instant::now();
     let result = loop {
         let mut messages = Vec::new();
@@ -447,6 +455,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
             true => app.frame_gap().saturating_sub(app.last_ack.elapsed()).min(TICK),
             false => TICK,
         };
+        let wait = wheel.wait(Instant::now()).map_or(wait, |remaining| remaining.min(wait));
         match rx.recv_timeout(wait) {
             Ok(message) => messages.push(message),
             Err(RecvTimeoutError::Timeout) => {}
@@ -464,6 +473,28 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
         let mut messages = messages.into_iter().enumerate().peekable();
         while let Some((index, message)) = messages.next() {
+            match &message {
+                Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
+                    for tick in wheel.report(*mouse, Instant::now()).into_iter().flatten() {
+                        redraw |= app.on_mouse(tick);
+                    }
+                    continue;
+                }
+                Msg::Term(
+                    Event::Key(_)
+                    | Event::Paste(_)
+                    | Event::Mouse(_)
+                    | Event::Focus(_)
+                    | Event::PixelMouse(_)
+                    | Event::CellSize { .. },
+                )
+                | Msg::Control(_) => {
+                    if let Some(tick) = wheel.finish() {
+                        redraw |= app.on_mouse(tick);
+                    }
+                }
+                _ => {}
+            }
             match message {
                 Msg::Term(Event::Mouse(mouse)) => {
                     // A burst of moves collapses to the last one.
@@ -624,10 +655,12 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                             }
                         }
                         Some(PageEvent::Url(url)) => {
+                            wheel.finish();
                             app.went_to(url);
                             redraw = true;
                         }
                         Some(PageEvent::Shown(url)) => {
+                            wheel.finish();
                             app.shown(url);
                             redraw = true;
                         }
@@ -672,6 +705,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 redraw = true;
             }
             if let Some(window) = size::window().filter(|w| *w != app.window) {
+                if let Some(tick) = wheel.finish() {
+                    redraw |= app.on_mouse(tick);
+                }
                 app.window = window;
                 if window.width_px == 0 {
                     term::query_cell_size();
@@ -681,6 +717,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 app.clear();
                 new_frame = true;
             }
+        }
+        if let Some(tick) = wheel.due(Instant::now()) {
+            redraw |= app.on_mouse(tick);
         }
         if new_frame || redraw {
             app.draw(new_frame);
@@ -1483,7 +1522,7 @@ impl App {
                 }
             }
             MouseKind::Wheel(dx, dy) => {
-                self.chrome.wheel(x, y, dx as f64 * WHEEL_STEP, dy as f64 * WHEEL_STEP, modifiers)
+                self.chrome.wheel(x, y, dx as f64 * self.wheel_step, dy as f64 * self.wheel_step, modifiers)
             }
         }
         false
