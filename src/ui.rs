@@ -33,12 +33,20 @@ pub enum Hit {
     Nothing,
 }
 
+fn downloads_width(cols: usize) -> usize {
+    if cols >= 32 {
+        3
+    } else {
+        0
+    }
+}
+
 /// The window switcher, between the field and ✕, when a page has opened
 /// windows and there's room: "‹ 2/3 ›" for the second window of three
 /// shown. `windows` is the one shown, from 1, and how many are open.
 fn switcher(windows: (usize, usize), cols: usize) -> Option<String> {
     let text = format!("‹ {}/{} ›", windows.0, windows.1);
-    (windows.1 > 1 && cols > MIN_COLS + text.chars().count()).then_some(text)
+    (windows.1 > 1 && cols > MIN_COLS + downloads_width(cols) + text.chars().count()).then_some(text)
 }
 
 /// What a column of the top bar holds.
@@ -66,7 +74,7 @@ pub fn hit(col: usize, cols: usize, windows: (usize, usize)) -> Hit {
         }
     } else if col >= switcher_start - NEW_TAB {
         Hit::NewTab
-    } else if cols >= 32 && col >= switcher_start - NEW_TAB - 3 {
+    } else if col >= switcher_start - NEW_TAB - downloads_width(cols) {
         Hit::Downloads
     } else if (FIELD..=cols - CLOSE).contains(&col) {
         Hit::Address(col.saturating_sub(FIELD + 1))
@@ -499,9 +507,9 @@ pub fn render_bar(
 
     let switcher = switcher(windows, cols);
     let switcher_width = switcher.as_ref().map_or(0, |text| text.chars().count());
-    let badge = badge.filter(|badge| cols > MIN_COLS + 3 + switcher_width + badge.chars().count());
+    let badge = badge.filter(|badge| cols > MIN_COLS + downloads_width(cols) + switcher_width + badge.chars().count());
     let badge_width = badge.map_or(0, |badge| badge.chars().count() + 1);
-    let downloads_width = if cols >= 32 { 3 } else { 0 };
+    let downloads_width = downloads_width(cols);
     let width = cols - downloads_width - FIELD - 2 - CLOSE - NEW_TAB - badge_width - switcher_width;
     let window = bar.window(width);
     let shown: Vec<char> = bar.text.iter().chain(&bar.completion).copied().collect();
@@ -771,6 +779,21 @@ mod tests {
                 }
             }
             assert_eq!(cells, 40, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_bar_keeps_an_address_cell_with_many_tabs() {
+        let tabs = (100, 100);
+        assert!(switcher(tabs, 32).is_none());
+        assert_eq!(hit(25, 32, tabs), Hit::Downloads);
+        assert!(switcher(tabs, 36).is_some());
+        for cols in MIN_COLS..=64 {
+            let mut field = AddressBar::default();
+            field.set_text("x");
+            let mut out = Vec::new();
+            render_bar(&mut out, &mut field, cols, false, None, Some("agent"), tabs);
+            assert!(String::from_utf8(out).unwrap().contains('x'), "width {cols}");
         }
     }
 
