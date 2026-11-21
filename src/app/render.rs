@@ -9,51 +9,95 @@ use std::io::{self, Write};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-/// A PTY write can finish while Rex is still parsing the previous image.
-/// Its terminal status reply is ordered after those bytes. Only page frames
-/// wait for it; toolbar updates and browser input remain independent.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Receipt {
+/// A PTY write can finish while Rex is still parsing the image. A numbered
+/// Kitty query after the image measures that progress and can be retried
+/// without a delayed reply ever releasing a newer frame.
+const FIRST_PROBE: u32 = 1 << 30; // Above page, tile and layer image IDs.
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy)]
+pub(super) struct Probe {
+    id: u32,
+    also_status: bool,
+}
+
+enum Delivery {
     Disabled,
     Ready,
     Writing,
     Waiting(Instant),
 }
 
+pub(super) struct Receipt {
+    delivery: Delivery,
+    id: u32,
+    numbered: bool,
+}
+
 impl Receipt {
-    pub fn allows_frame(&mut self, now: Instant) -> bool {
-        if matches!(self, Self::Waiting(at) if now.duration_since(*at) >= Duration::from_secs(1)) {
-            // An unanswered status query has no ID. Stop querying so a late
-            // reply can never release the wrong frame.
-            *self = Self::Disabled;
-        }
-        matches!(self, Self::Ready | Self::Disabled)
+    pub fn new(rex: bool) -> Self {
+        Self { delivery: if rex { Delivery::Ready } else { Delivery::Disabled }, id: FIRST_PROBE, numbered: false }
     }
 
-    pub fn request(&mut self) -> bool {
-        if *self != Self::Ready {
-            return false;
+    pub fn allows_frame(&self, now: Instant) -> bool {
+        match self.delivery {
+            Delivery::Ready | Delivery::Disabled => true,
+            Delivery::Writing => false,
+            // Older relays may only answer status queries, or send no
+            // replies at all. Still show a recent snapshot during silence.
+            Delivery::Waiting(at) => !self.numbered && now.duration_since(at) >= PROBE_INTERVAL,
         }
-        *self = Self::Writing;
-        true
+    }
+
+    pub fn request(&mut self) -> Option<Probe> {
+        if matches!(self.delivery, Delivery::Disabled) {
+            return None;
+        }
+        self.id = if self.id == i32::MAX as u32 { FIRST_PROBE } else { self.id + 1 };
+        self.delivery = Delivery::Writing;
+        Some(Probe { id: self.id, also_status: !self.numbered })
+    }
+
+    pub fn retry(&mut self, now: Instant) -> Option<Probe> {
+        if self.numbered && matches!(self.delivery, Delivery::Waiting(at) if now.duration_since(at) >= PROBE_INTERVAL) {
+            self.delivery = Delivery::Writing;
+            Some(Probe { id: self.id, also_status: false })
+        } else {
+            None
+        }
     }
 
     pub fn written(&mut self, now: Instant) {
-        if *self == Self::Writing {
-            *self = Self::Waiting(now);
+        if matches!(self.delivery, Delivery::Writing) {
+            self.delivery = Delivery::Waiting(now);
         }
     }
 
-    pub fn received(&mut self) {
-        if matches!(self, Self::Writing | Self::Waiting(_)) {
-            *self = Self::Ready;
+    pub fn graphics(&mut self, id: u32) -> bool {
+        if !(FIRST_PROBE..=i32::MAX as u32).contains(&id) {
+            return false;
+        }
+        // Even an error reply proves that Rex parsed the preceding bytes.
+        // A slow first reply can confirm support after a fallback snapshot
+        // was sent. Only the current ID releases that newer snapshot.
+        if id <= self.id && !matches!(self.delivery, Delivery::Disabled) {
+            self.numbered = true;
+            if self.id == id {
+                self.delivery = Delivery::Ready;
+            }
+        }
+        true
+    }
+
+    pub fn status(&mut self) {
+        if !self.numbered && matches!(self.delivery, Delivery::Writing | Delivery::Waiting(_)) {
+            self.delivery = Delivery::Ready;
         }
     }
 }
 
 pub(super) struct Frame {
     pub png: Arc<String>,
-    pub request_receipt: bool,
     pub route: Route,
     pub scaled: bool,
     pub cells: (u16, u16),
@@ -62,7 +106,7 @@ pub(super) struct Frame {
 }
 
 pub(super) enum Command {
-    Draw { controls: term::PendingOutput, frame: Option<Frame>, overlay: Vec<u8> },
+    Draw { controls: term::PendingOutput, frame: Option<Frame>, overlay: Vec<u8>, probe: Option<Probe> },
     Reply(u32, bool),
     Refresh,
 }
@@ -94,13 +138,12 @@ pub(super) fn run(mut page: PageImage, jobs: mpsc::Receiver<Command>, events: &m
                     break;
                 }
             }
-            Command::Draw { mut controls, frame, overlay } => {
+            Command::Draw { mut controls, frame, overlay, probe } => {
                 let mut bytes = b"\x1b[?2026h".to_vec();
                 if controls.clear {
                     page.forget();
                 }
                 controls.append(&mut bytes);
-                let request_receipt = frame.as_ref().is_some_and(|frame| frame.request_receipt);
                 if let Some(frame) = frame {
                     let drawn = page.draw(
                         &mut bytes,
@@ -116,8 +159,11 @@ pub(super) fn run(mut page: PageImage, jobs: mpsc::Receiver<Command>, events: &m
                 }
                 bytes.extend(overlay);
                 bytes.extend_from_slice(b"\x1b[?2026l");
-                if request_receipt {
-                    bytes.extend_from_slice(b"\x1b[5n");
+                if let Some(probe) = probe {
+                    write!(bytes, "\x1b_Ga=q,i={},f=24,s=1,v=1;AAAA\x1b\\", probe.id)?;
+                    if probe.also_status {
+                        bytes.extend_from_slice(b"\x1b[5n");
+                    }
                 }
                 let mut out = io::stdout().lock();
                 out.write_all(&bytes)?;
@@ -138,23 +184,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn early_late_and_missing_replies() {
+    fn lost_and_late_receipts_only_release_their_own_frame() {
         let now = Instant::now();
-        let later = now + Duration::from_secs(2);
-        let mut receipt = Receipt::Ready;
-        assert!(receipt.request());
+        let later = now + PROBE_INTERVAL;
+        let mut receipt = Receipt::new(true);
+        let first = receipt.request().unwrap();
+        assert!(first.also_status);
+        receipt.graphics(first.id);
+        receipt.written(now); // Replies can arrive before the writer notification.
+        assert!(receipt.allows_frame(now));
+
+        let second = receipt.request().unwrap();
+        assert!(!second.also_status);
+        receipt.written(now);
+        receipt.status();
+        receipt.graphics(first.id);
         assert!(!receipt.allows_frame(later));
-        receipt.received();
+        assert_eq!(receipt.retry(later).unwrap().id, second.id);
         receipt.written(later);
+        receipt.graphics(second.id);
+        let third = receipt.request().unwrap();
+        receipt.graphics(second.id);
+        assert!(!receipt.allows_frame(later));
+        receipt.graphics(third.id);
         assert!(receipt.allows_frame(later));
-        assert!(receipt.request());
+    }
+
+    #[test]
+    fn a_late_first_probe_enables_pacing_without_releasing_the_next_frame() {
+        let now = Instant::now();
+        let mut receipt = Receipt::new(true);
+        let first = receipt.request().unwrap();
+        receipt.written(now);
+        assert!(receipt.allows_frame(now + PROBE_INTERVAL));
+        let next = receipt.request().unwrap();
+        receipt.written(now + PROBE_INTERVAL);
+        receipt.graphics(first.id);
+        receipt.status();
+        assert!(!receipt.allows_frame(now + PROBE_INTERVAL * 2));
+        assert_eq!(receipt.retry(now + PROBE_INTERVAL * 2).unwrap().id, next.id);
+    }
+
+    #[test]
+    fn missing_legacy_replies_allow_only_periodic_snapshots() {
+        let now = Instant::now();
+        let mut receipt = Receipt::new(true);
+        receipt.request();
         receipt.written(now);
         assert!(!receipt.allows_frame(now));
-        receipt.received();
-        assert!(receipt.request());
-        receipt.written(now);
-        assert!(receipt.allows_frame(later));
-        receipt.received();
-        assert!(!receipt.request());
+        assert!(receipt.allows_frame(now + PROBE_INTERVAL));
+        receipt.request();
+        receipt.written(now + PROBE_INTERVAL);
+        assert!(!receipt.allows_frame(now + PROBE_INTERVAL));
+        receipt.status();
+        assert!(receipt.allows_frame(now + PROBE_INTERVAL));
+        assert!(Receipt::new(false).request().is_none());
     }
 }

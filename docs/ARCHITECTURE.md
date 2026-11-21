@@ -21,14 +21,15 @@ is in flight. Frames superseded during preparation or output never become
 the base for a later delta. File replies and refresh requests reach the
 same worker in order. File-transfer timeouts start after the write.
 
-In Rex each page update ends with a terminal status query (CSI 5 n).
-A successful PTY write only means the bytes reached the kernel. The reply
-means the Rex terminal has parsed the batch. Until then, kb holds the newest
-Chrome frame and continues sending text UI updates. If the reply takes over
-one second after the write, kb resumes normal writes and stops issuing
-queries for this session. The reply measures progress at the server terminal.
-`python3 tests/rex-backpressure.py` exercises an eight-frame-per-second
-consumer that drains the PTY immediately and delays its terminal replies.
+In Rex each page update ends with a numbered Kitty graphics query. Its
+reply means the Rex server terminal has parsed the preceding bytes.
+While waiting, kb retains the newest Chrome frame and sends text UI updates.
+If the terminal stalls or a reply is lost, kb retries the small query with
+the same ID. A late reply can only release its own frame. Until numbered
+replies are confirmed, kb also accepts a terminal status reply (CSI 5 n)
+and allows one fresh snapshot per second when both replies are missing.
+This measures progress at the server terminal. `python3 tests/rex-backpressure.py`
+exercises a stalled consumer that continues draining the PTY.
 
 Opening the quit question pauses page painting until the user answers.
 Cancelling presents the latest frame even if the animation has stopped.

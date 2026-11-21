@@ -41,16 +41,25 @@ def check(folder):
     # ordered status reply tells kb when this terminal has consumed the image.
     batches = queue.Queue()
     first_frame = threading.Event()
+    resumed = threading.Event()
     question = threading.Event()
-    received = presented = 0
+    received = presented = peak = 0
 
     def read_pty():
-        nonlocal received
+        nonlocal received, peak
         buf = bytearray()
         try:
             while chunk := os.read(master, 65536):
                 buf.extend(chunk)
                 while buf:
+                    if buf.startswith(b"\x1b_Ga=q,i="):
+                        end = buf.find(b"\x1b\\", 2)
+                        if end < 0:
+                            break
+                        probe = bytes(buf[len(b"\x1b_Ga=q,i="):end]).split(b",", 1)[0]
+                        batches.put(probe)
+                        del buf[:end + 2]
+                        continue
                     if buf.startswith(QUERY):
                         batches.put("query")
                         del buf[:len(QUERY)]
@@ -62,6 +71,7 @@ def check(folder):
                     del buf[:end + len(END)]
                     if b"\x1b_Ga=T" in batch or b"\x1b_Ga=p" in batch:
                         received += 1
+                        peak = max(peak, received - presented)
                         batches.put("image")
                     if b"Quit KittyBrowser?" in batch:
                         batches.put("question")
@@ -70,11 +80,21 @@ def check(folder):
 
     def display():
         nonlocal presented
+        dropped = False
         while item := batches.get():
             if item == "image":
-                time.sleep(0.125)
+                # After receipts are working, stall longer than the old
+                # one-second timeout. No more images should collect behind it.
+                time.sleep(2.4 if presented == 3 else 0.125)
                 presented += 1
                 first_frame.set()
+                if presented >= 6:
+                    resumed.set()
+            elif isinstance(item, bytes):
+                if presented == 5 and not dropped:
+                    dropped = True
+                    continue
+                os.write(master, b"\x1b_Gi=" + item + b";OK\x1b\\")
             elif item == "query":
                 os.write(master, b"\x1b[0n")
             elif item == "question":
@@ -86,7 +106,7 @@ def check(folder):
     consumer.start()
     try:
         assert first_frame.wait(10), "no visible page"
-        time.sleep(4)
+        assert resumed.wait(10), "animation did not recover after the stalled terminal"
         backlog = received - presented
         started = time.monotonic()
         os.write(master, b"\x1b[<0;100;1M\x1b[<0;100;1m")
@@ -95,7 +115,7 @@ def check(folder):
         os.write(master, b"y")
         assert process.wait(timeout=5) == 0
         assert presented >= 4, "the animation stopped updating"
-        assert backlog <= 1, "stale page images accumulated ahead of the toolbar"
+        assert peak <= 1, f"{peak} page images accumulated ahead of the toolbar"
     finally:
         if process.poll() is None:
             process.terminate()
