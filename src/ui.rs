@@ -3,6 +3,7 @@
 
 use crate::term::input::{Key, KeyCode};
 use std::fmt::Write;
+use unicode_width::UnicodeWidthStr;
 
 /// Columns (1-based) of the top bar. Each button is three cells wide.
 const BACK: std::ops::RangeInclusive<usize> = 1..=3;
@@ -93,7 +94,6 @@ impl TabStrip {
     }
 
     pub fn render<'a>(&self, out: &mut Vec<u8>, active: usize, label: impl Fn(usize) -> &'a str) {
-        use unicode_width::UnicodeWidthStr;
         let colors = palette();
         let mut line = format!("\x1b[2;1H{}\x1b[2K", colors.bar);
         for slot in 0..self.count {
@@ -418,9 +418,18 @@ pub struct Rect {
 /// dimmed. Returns where the box is, to blank it later with `blank`. Lines
 /// too long for the screen are cut, and lines that don't fit are dropped.
 pub fn render_box(out: &mut Vec<u8>, lines: &[String], cols: u16, rows: u16) -> Rect {
-    let inner = lines.iter().map(|line| unmark(line).chars().count()).max().unwrap_or(0);
+    let visible: Vec<_> = lines
+        .iter()
+        .take(usize::from(rows.saturating_sub(3)))
+        .map(|line| {
+            let text: String = unmark(line).chars().filter(|c| !c.is_control()).collect();
+            let cells = text.width();
+            (line, text, cells)
+        })
+        .collect();
+    let inner = visible.iter().map(|(_, _, cells)| *cells).max().unwrap_or(0);
     let width = inner.saturating_add(4).min(cols as usize) as u16;
-    let height = (lines.len() as u16 + 2).min(rows.saturating_sub(1));
+    let height = (visible.len() as u16 + 2).min(rows.saturating_sub(1));
     let col = (cols - width) / 2 + 1;
     let row = 2 + (rows.saturating_sub(1) - height) / 2;
     let text_width = width.saturating_sub(4) as usize;
@@ -429,15 +438,30 @@ pub fn render_box(out: &mut Vec<u8>, lines: &[String], cols: u16, rows: u16) -> 
     let colors = palette();
     let box_style = colors.box_style.as_str();
     let _ = write!(s, "\x1b[{row};{col}H{box_style}╭{rule}╮");
-    for (n, line) in lines.iter().take(height.saturating_sub(2) as usize).enumerate() {
+    for (n, (line, mut text, cells)) in visible.into_iter().enumerate() {
         let style = match line.chars().next() {
             Some(ART_LINE) => colors.box_art.as_str(),
             Some(TITLE_LINE) => colors.box_title.as_str(),
             Some('\t') => colors.box_dim.as_str(),
             _ => box_style,
         };
-        let text: String = unmark(line).chars().filter(|c| !c.is_control()).take(text_width).collect();
-        let pad = text_width - text.chars().count();
+        // A reviewed path may fill the row with room for every combining mark.
+        // Only clip an overflowing line, and keep the right border in its cell.
+        if cells > text_width {
+            // Search byte offsets so a long name with zero-width marks does
+            // not require measuring every successively longer prefix.
+            let (mut fits, mut over) = (0, text.len());
+            while over - fits > 1 {
+                let mid = fits + (over - fits) / 2;
+                if text[..text.floor_char_boundary(mid)].width() <= text_width {
+                    fits = mid;
+                } else {
+                    over = mid;
+                }
+            }
+            text.truncate(text.floor_char_boundary(fits));
+        }
+        let pad = text_width - text.width();
         let _ = write!(s, "\x1b[{};{col}H{box_style}│ {style}{text}{:pad$}{box_style} │", row + 1 + n as u16, "");
     }
     let _ = write!(s, "\x1b[{};{col}H{box_style}╰{rule}╯\x1b[0m", row + height - 1);
@@ -590,6 +614,20 @@ mod tests {
         bar.set_completion(Some(page_text.into()));
         assert!(!bar.text().contains(char::is_control));
         assert_eq!(crate::term::printable("one\u{1b}\r\u{85}\ntwo\tthree"), "one���\ntwo\tthree");
+    }
+
+    #[test]
+    fn box_measures_and_clips_file_names_in_terminal_cells() {
+        let path = "/e\u{301}\u{301}界.z";
+        let mut out = Vec::new();
+        let rect = super::render_box(&mut out, &[path.into(), "界界界界".into()], 10, 10);
+        assert_eq!(rect.width, 10);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(path));
+        assert!(text.contains("界界界"));
+        assert!(!text.contains("界界界界"));
+        let rect = super::render_box(&mut Vec::new(), &["界".into()], 80, 10);
+        assert_eq!(rect.width, 6);
     }
 
     #[test]
