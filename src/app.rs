@@ -519,7 +519,7 @@ fn browse(
     // Rex can read a server-side file even when the display is remote.
     // Moving existing placements avoids repeatedly forwarding raw page pixels.
     let rex = std::env::var_os("REX_SESSION").is_some() && std::env::var_os("REX_BLOCK").is_some();
-    let mut receipt = if rex { render::Receipt::Ready } else { render::Receipt::Disabled };
+    let mut receipt = render::Receipt::new(rex);
     let preferred = Route::preferred(std::env::var("KB_TRANSFER").ok().as_deref(), rex);
     match preferred {
         Route::Files | Route::LayerFiles => app.file_probe = graphics::ask_about_files(&mut page.files),
@@ -544,7 +544,7 @@ fn browse(
 
     // A single draw spans preparation and output. While it is in flight,
     // only app.frame and the dirty flags change, so the next draw is current.
-    frames.send(app.draw(false, false)).map_err(|_| "terminal writer stopped")?;
+    frames.send(app.draw(false, None)).map_err(|_| "terminal writer stopped")?;
     let mut writing = true;
     let mut writing_tab_result = None;
     let mut toolbar_first = false;
@@ -729,6 +729,9 @@ fn browse(
                     }
                 }
                 Msg::Term(Event::Graphics { id, ok }, _) => {
+                    if receipt.graphics(id) {
+                        continue;
+                    }
                     log(format_args!("graphics reply for image {id}: {ok}"));
                     let _ = frames.send(render::Command::Reply(id, ok));
                     if id == graphics::FILE_QUERY_ID {
@@ -754,7 +757,7 @@ fn browse(
                     }
                     app.focused = focused;
                 }
-                Msg::Term(Event::StatusOk, _) => receipt.received(),
+                Msg::Term(Event::StatusOk, _) => receipt.status(),
                 Msg::Term(Event::PixelMouse(on), _) => {
                     log(format_args!("pixel mouse: {on}"));
                     app.pixel_mouse = on;
@@ -963,9 +966,10 @@ fn browse(
             && app.opening_tab.is_none()
             && !app.asking_quit
             && receipt.allows_frame(Instant::now());
-        if !writing && (paint_page || redraw || app.output.any()) {
-            let query = paint_page && app.frame.is_some() && receipt.request();
-            if frames.send(app.draw(paint_page, query)).is_err() {
+        let retry = if !writing && new_frame && !paint_page { receipt.retry(Instant::now()) } else { None };
+        if !writing && (paint_page || redraw || app.output.any() || retry.is_some()) {
+            let probe = if paint_page && app.frame.is_some() { receipt.request() } else { retry };
+            if frames.send(app.draw(paint_page, probe)).is_err() {
                 break Err("terminal writer stopped".to_owned());
             }
             writing = true;
@@ -993,7 +997,7 @@ fn browse(
     // Finish already-started escapes before restoring the user's terminal or
     // dropping the private files they refer to. Honour a copy just before quit.
     if app.output.clipboard.is_some() {
-        let _ = frames.send(app.draw(false, false));
+        let _ = frames.send(app.draw(false, None));
     }
     drop(frames);
     let joined = writer.join();
@@ -1367,10 +1371,9 @@ impl App {
         self.chrome.navigate(url);
     }
 
-    fn draw(&mut self, paint_page: bool, request_receipt: bool) -> render::Command {
+    fn draw(&mut self, paint_page: bool, probe: Option<render::Probe>) -> render::Command {
         let frame = self.frame.as_ref().filter(|_| paint_page).map(|png| render::Frame {
             png: Arc::clone(png),
-            request_receipt,
             route: if self.frame_is_preview && self.route == Route::LayerFiles { Route::Preview } else { self.route },
             scaled: self.fixed.is_some(),
             cells: self.shown,
@@ -1413,7 +1416,7 @@ impl App {
             None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
-        render::Command::Draw { controls: std::mem::take(&mut self.output), frame, overlay: out }
+        render::Command::Draw { controls: std::mem::take(&mut self.output), frame, overlay: out, probe }
     }
 
     /// Open the find field in the address bar's place.
