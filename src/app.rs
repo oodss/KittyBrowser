@@ -526,13 +526,11 @@ fn browse(
                 tab_input.push(message);
                 continue;
             }
-            if let Msg::Term(event) = &message {
-                if app.download_input(event) {
+            match &message {
+                Msg::Term(event) if app.download_input(event) => {
                     redraw = true;
                     continue;
                 }
-            }
-            match &message {
                 Msg::Term(Event::Mouse(mouse @ Mouse { kind: MouseKind::Wheel(..), .. })) => {
                     for tick in wheel.report(*mouse, Instant::now()).into_iter().flatten() {
                         redraw |= app.on_mouse(tick);
@@ -1079,6 +1077,10 @@ impl App {
             ui::blank(out, old);
         }
         if !self.help {
+            if self.downloads.open {
+                self.help_rect = Some(self.downloads.draw(out, self.window));
+                out.extend_from_slice(b"\x1b[?25l");
+            }
             return;
         }
         let lines = self.panel.clone().unwrap_or_else(|| self.help_lines());
@@ -1246,10 +1248,6 @@ impl App {
             None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
-        if self.downloads.open {
-            self.help_rect = Some(self.downloads.draw(&mut out, self.window));
-            out.extend_from_slice(b"\x1b[?25l");
-        }
         out.extend_from_slice(b"\x1b[?2026l");
         out
     }
