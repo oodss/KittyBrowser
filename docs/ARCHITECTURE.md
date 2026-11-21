@@ -240,6 +240,24 @@ when Chrome answers each change. And macOS keeps windows at least 500
 wide, so a narrower viewport comes in frames 500 wide, holding the page in
 their top left; kb cuts those to the viewport (`Window::crop`).
 
+**Scrolling in large Rex panes.** On the default Rex file-backed route, two
+wheel events within 120 ms switch Chrome's PNG capture to half the native
+width and height for views of at least 900,000 pixels. CSS layout and pointer
+coordinates stay in the same viewport. After 180 ms without wheel input, kb
+requests native frames again. A screencast restart produces the sharp frame
+even on a static page. A missing preview, a file transfer failure, or an
+explicit `KB_SCROLL_PREVIEW=0` falls back to native capture.
+
+Rex scales preview bands to whole terminal cells. kb matches four columns
+independently so an animation on one side can leave the other in place. A
+row fingerprint suggests a crop from the reference image. kb compares every
+byte before reusing it, and sends compressed pixels for exposed areas. Those
+patches remain reusable while visible. A fragmented frame, too little matching
+content, or two extra previews of retained pixels triggers a fresh PNG. New bases are
+placed before retiring the old images at both ends of the gesture. The usual
+one-frame backpressure and file acknowledgements apply to both capture sizes.
+This trades some sharpness during movement for more frequent screen updates.
+
 **Pacing** (`App::frame_gap`). A focused pane acknowledges frames immediately
 for half a second after input. Once input stops, the usual limit is 10 fps.
 Sustained visible motion raises the target to 24 fps. A worker samples a

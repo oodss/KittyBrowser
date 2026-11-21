@@ -20,6 +20,7 @@ pub struct PageImage {
     /// sent, when it is drawn that way (the terminal can't read files, as
     /// over ssh).
     layers: Layers,
+    preview: super::preview::Preview,
     sent: Option<Instant>,
     first_patch: Option<Instant>,
     /// Chrome or the pane changed while the terminal was reading a batch.
@@ -39,6 +40,8 @@ pub enum Route {
     Layers,
     /// Moved layers with large payloads read locally by the Rex server.
     LayerFiles,
+    /// A lower-resolution gesture frame, scaled to the same page cells.
+    Preview,
     /// Through the pty, whole PNG frames only (`KB_TRANSFER=png`): for a
     /// terminal with no more of the kitty protocol than that.
     Png,
@@ -58,7 +61,7 @@ impl Route {
     pub fn without_files(self) -> Self {
         match self {
             Self::Files => Self::Png,
-            Self::LayerFiles => Self::Layers,
+            Self::LayerFiles | Self::Preview => Self::Layers,
             route => route,
         }
     }
@@ -67,6 +70,7 @@ impl Route {
 /// The ways of drawing the page.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Drawer {
+    Preview,
     Tiles,
     Layers,
     /// One image, scaled to fit the cells.
@@ -76,6 +80,7 @@ enum Drawer {
 impl PageImage {
     /// The screen was cleared of images: the next draw starts again.
     pub fn forget(&mut self) {
+        self.preview = Default::default();
         self.tiles.forget();
         self.layers.forget();
         self.on_screen = None;
@@ -85,6 +90,7 @@ impl PageImage {
     /// A focus report can mean the client lost its placements. Rebuild a
     /// complete base while retaining the IDs needed to retire any survivors.
     pub fn refresh(&mut self) {
+        self.preview.refresh();
         self.tiles.refresh();
         self.layers.refresh();
         self.first_patch = None;
@@ -103,7 +109,10 @@ impl PageImage {
                 self.sent = None;
                 return std::mem::take(&mut self.deferred);
             }
-        } else if !ok && self.on_screen == Some(Drawer::Layers) && self.layers.holds(id) {
+        } else if !ok
+            && ((self.on_screen == Some(Drawer::Layers) && self.layers.holds(id))
+                || (self.on_screen == Some(Drawer::Preview) && self.preview.holds(id)))
+        {
             self.refresh();
             return true;
         }
@@ -150,9 +159,16 @@ impl PageImage {
     /// Hand the screen to `drawer`. Each knows only its own images, so when
     /// another drew what is there, all of it goes first: left, it could
     /// cover what the new one draws.
-    fn hand_to(&mut self, out: &mut Vec<u8>, drawer: Drawer) {
+    fn hand_to(&mut self, out: &mut Vec<u8>, retire: &mut Vec<u8>, drawer: Drawer) {
         if self.on_screen != Some(drawer) {
-            out.extend_from_slice(graphics::DELETE);
+            // A gesture can switch drawers twice in under a second. Keep the
+            // displayed image until Rex has the new base, even on a slow link.
+            match (self.on_screen, drawer) {
+                (Some(Drawer::Preview), _) => self.preview.retire(retire),
+                (Some(Drawer::Layers), Drawer::Preview) => self.layers.retire(retire),
+                (Some(Drawer::Whole), Drawer::Preview) => retire.extend_from_slice(b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\"),
+                _ => out.extend_from_slice(graphics::DELETE),
+            }
             self.forget();
             self.on_screen = Some(drawer);
         }
@@ -180,9 +196,23 @@ impl PageImage {
         }
         let route = if self.files_failed { route.without_files() } else { route };
         let start = out.len();
+        let mut retire = Vec::new();
+        if route == Route::Preview {
+            self.hand_to(out, &mut retire, Drawer::Preview);
+            if let Some(whole) = self.preview.draw(out, png, cols, rows, top, &mut self.files) {
+                if whole {
+                    self.first_patch = None;
+                } else {
+                    self.first_patch.get_or_insert_with(Instant::now);
+                }
+                out.append(&mut retire);
+                return if whole { "scroll preview base" } else { "scroll preview bands" }.into();
+            }
+            out.append(&mut retire);
+        }
         let mut pixels = match route {
             Route::Files => crate::base64::decode(png).and_then(|bytes| graphics::decode_png(&bytes, Vec::new())),
-            Route::Layers | Route::LayerFiles | Route::Png => None,
+            Route::Layers | Route::LayerFiles | Route::Png | Route::Preview => None,
         };
         // Only what changed, when the frame lines up with the cells: tiles
         // by file, or layers through the pty. Otherwise (a fixed viewport,
@@ -193,7 +223,7 @@ impl PageImage {
             None if lined_up && matches!(route, Route::LayerFiles | Route::Layers) => Drawer::Layers,
             _ => Drawer::Whole,
         };
-        self.hand_to(out, drawer);
+        self.hand_to(out, &mut retire, drawer);
         let before_draw = out.len();
         let drawn = match drawer {
             Drawer::Tiles => pixels
@@ -204,7 +234,7 @@ impl PageImage {
                 .layers
                 .draw(out, png, cols, rows, cell, top, (route == Route::LayerFiles).then_some(&mut self.files))
                 .map(|sent| (matches!(sent, super::layers::Sent::Whole(_)), format!("{sent:?}"))),
-            Drawer::Whole => None,
+            Drawer::Preview | Drawer::Whole => None,
         };
         if let Some((whole, drawn)) = drawn {
             if whole {
@@ -212,6 +242,7 @@ impl PageImage {
             } else if out.len() > before_draw {
                 self.first_patch.get_or_insert_with(Instant::now);
             }
+            out.append(&mut retire);
             return drawn;
         }
         if drawer == Drawer::Tiles {
@@ -220,16 +251,19 @@ impl PageImage {
             out.truncate(start);
             self.fallback();
         }
-        self.hand_to(out, Drawer::Whole);
+        self.hand_to(out, &mut retire, Drawer::Whole);
         out.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
         if let Some(pixels) = pixels {
             if let Ok(path) = self.files.page_file(graphics::IMAGE_ID, &pixels.data) {
                 graphics::put_file(out, path, &pixels, cols, rows);
+                out.append(&mut retire);
                 return "the whole frame, by file".to_owned();
             }
             self.fallback();
         }
-        if graphics::put_png(out, png, cols, rows, (route == Route::LayerFiles).then_some(&mut self.files)) {
+        let by_file = graphics::put_png(out, png, cols, rows, (route == Route::LayerFiles).then_some(&mut self.files));
+        out.append(&mut retire);
+        if by_file {
             "the whole PNG, by file".to_owned()
         } else {
             "the whole frame, through the pty".to_owned()
@@ -276,6 +310,20 @@ mod tests {
         image.draw(&mut out, &encode(&page(12, 5)), Route::Layers, false, COLS, ROWS, CELL, 2);
         screen.feed(&out, CELL);
         shows(&mut image, &mut screen, &page(16, 10), Route::Layers);
+    }
+
+    #[test]
+    fn gesture_handoffs_place_a_new_base_before_retiring_the_old_images() {
+        let (mut image, mut screen) = (PageImage::default(), Screen::default());
+        for native in [Route::Layers, Route::Png] {
+            shows(&mut image, &mut screen, &page(16, 0), native);
+            for (route, start) in [(Route::Preview, 3), (native, 9)] {
+                let wire = shows(&mut image, &mut screen, &page(16, start), route);
+                assert!(!wire.contains("a=d,d=A"));
+                assert!(wire.find("a=T,").unwrap() < wire.find("a=d,").unwrap());
+                shows(&mut image, &mut screen, &page(16, start + 2), route);
+            }
+        }
     }
 
     #[test]

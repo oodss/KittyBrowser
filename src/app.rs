@@ -221,6 +221,8 @@ struct App {
     output: term::PendingOutput,
     downloads: downloads::Downloads,
     wheel_step: f64,
+    scroll_capture: crate::scroll::ScrollCapture,
+    preview_enabled: bool,
     chrome: Chrome,
     scale: f64,
     window: Window,
@@ -248,6 +250,7 @@ struct App {
     loading: bool,
     /// The newest frame, kept to redraw at a new size.
     frame: Option<Arc<String>>,
+    frame_is_preview: bool,
     pacing: crate::motion::FramePacing,
     route: Route,
     /// Browser zoom: 1 is 100%. It scales the device pixels per CSS pixel,
@@ -395,6 +398,8 @@ fn browse(
         output: Default::default(),
         downloads: Default::default(),
         wheel_step: f64::from(wheel_step),
+        scroll_capture: Default::default(),
+        preview_enabled: std::env::var_os("KB_SCROLL_PREVIEW").as_deref() != Some(std::ffi::OsStr::new("0")),
         chrome,
         scale: options.scale,
         window,
@@ -412,6 +417,7 @@ fn browse(
         url: String::new(),
         loading: false,
         frame: None,
+        frame_is_preview: false,
         pacing: crate::motion::FramePacing::new(),
         route: Route::Layers,
         zoom: 1.0,
@@ -503,7 +509,8 @@ fn browse(
             true => app.frame_gap().saturating_sub(app.last_ack.elapsed()).min(TICK),
             false => TICK,
         };
-        let wait = wheel.wait(Instant::now()).map_or(wait, |remaining| remaining.min(wait));
+        let now = Instant::now();
+        let wait = [Some(wait), wheel.wait(now), app.scroll_capture.wait(now)].into_iter().flatten().min().unwrap();
         if messages.is_empty() {
             match rx.recv_timeout(wait) {
                 Ok(message) => messages.push(message),
@@ -659,6 +666,7 @@ fn browse(
                         new_frame = true;
                     }
                     if focused != app.focused {
+                        app.end_scroll_capture();
                         app.pacing.reset();
                     }
                     app.focused = focused;
@@ -730,12 +738,13 @@ fn browse(
                     app.devtools.observe(&message, &mut app.chrome);
                     match app.chrome.handle(message) {
                         Some(PageEvent::Frame(png)) => {
-                            let fits = app.fits(&png);
-                            log(format_args!(
-                                "frame {:?}, {} bytes, fits: {fits}",
-                                graphics::png_size(&png),
-                                png.len()
-                            ));
+                            let size = graphics::png_size(&png);
+                            let preview = size.is_some_and(|size| app.scroll_capture.accepts(size));
+                            if preview {
+                                app.scroll_capture.arrived();
+                            }
+                            let fits = preview || size.is_some_and(|size| app.native_size(size));
+                            log(format_args!("frame {:?}, {} bytes, fits: {fits}", size, png.len()));
                             // A frame rendered for another size (the pane's
                             // first guess, or the size before a resize) would be
                             // stretched to fill the pane: wait for the right one.
@@ -746,6 +755,7 @@ fn browse(
                                 if app.focused && app.last_input.elapsed() >= ACTIVE {
                                     app.pacing.frame(&frame, Instant::now());
                                 }
+                                app.frame_is_preview = preview;
                                 app.frame = Some(frame);
                                 new_frame = true;
                             }
@@ -789,6 +799,7 @@ fn browse(
                     writing = false;
                     if files_failed {
                         app.route = app.route.without_files();
+                        app.end_scroll_capture();
                     }
                 }
                 // Join the writer below to collect its error, even if the
@@ -841,6 +852,12 @@ fn browse(
         }
         if let Some(tick) = wheel.due(Instant::now()) {
             redraw |= app.on_mouse(tick);
+        }
+        if app.scroll_capture.unavailable(Instant::now()) {
+            app.preview_enabled = false;
+            app.end_scroll_capture();
+        } else if app.scroll_capture.wait(Instant::now()) == Some(Duration::ZERO) {
+            app.end_scroll_capture();
         }
         let strip = app.chrome.windows().1 > 1 && app.window.rows >= 3;
         if strip != app.tab_strip {
@@ -923,6 +940,7 @@ impl App {
 
     /// Size the page's viewport to the cells below the top bar.
     fn layout(&mut self) {
+        self.end_scroll_capture();
         let (cell_w, cell_h) = self.cell();
         let (cols, rows) = (self.window.cols, self.page_rows());
         // The space for the page, in device pixels.
@@ -963,7 +981,8 @@ impl App {
             self.pacing.reset();
         }
         self.viewport = viewport;
-        if self.frame.as_deref().is_some_and(|png| !self.fits(png)) {
+        if self.frame.as_deref().is_some_and(|png| !graphics::png_size(png).is_some_and(|size| self.native_size(size)))
+        {
             self.frame = None;
         }
         self.chrome.resize(self.viewport.0, self.viewport.1, self.scale);
@@ -1067,7 +1086,7 @@ impl App {
                 match self.route {
                     Route::Files => "by file, changed blocks only",
                     Route::Layers => "through the pty, what moved or changed",
-                    Route::LayerFiles => "moved layers, large images by server file",
+                    Route::Preview | Route::LayerFiles => "moved layers, large images by server file",
                     Route::Png => "through the pty, whole PNG frames",
                 }
                 .to_owned(),
@@ -1163,6 +1182,7 @@ impl App {
 
     /// The page shown is at `url` now.
     fn went_to(&mut self, url: String) {
+        self.end_scroll_capture();
         log(format_args!("url {url}"));
         self.pacing.reset();
         self.copy_request = CopyRequest::default();
@@ -1216,8 +1236,7 @@ impl App {
 
     /// Whether a frame was rendered at the size the page is laid out at now,
     /// give or take rounding.
-    fn fits(&self, png: &str) -> bool {
-        let Some((width, height)) = graphics::png_size(png) else { return false };
+    fn native_size(&self, (width, height): (u32, u32)) -> bool {
         let close = |actual: u32, css: u32| {
             // Chrome renders at its launch scale whatever the zoom: zoomed
             // in, the frame has fewer pixels than the cells and is stretched
@@ -1226,6 +1245,13 @@ impl App {
             (actual as f64 - expected).abs() <= (expected / 100.0).max(2.0)
         };
         close(width, self.viewport.0) && close(height, self.viewport.1)
+    }
+
+    fn end_scroll_capture(&mut self) {
+        if self.scroll_capture.preview.is_some() {
+            self.chrome.scroll_capture(None);
+        }
+        self.scroll_capture = Default::default();
     }
 
     fn navigate(&mut self, url: &str) {
@@ -1240,7 +1266,7 @@ impl App {
         let frame = self.frame.as_ref().filter(|_| paint_page).map(|png| render::Frame {
             png: Arc::clone(png),
             request_receipt,
-            route: self.route,
+            route: if self.frame_is_preview && self.route == Route::LayerFiles { Route::Preview } else { self.route },
             scaled: self.fixed.is_some(),
             cells: self.shown,
             cell: self.cell(),
@@ -1741,7 +1767,18 @@ impl App {
                 }
             }
             MouseKind::Wheel(dx, dy) => {
-                self.chrome.wheel(x, y, dx as f64 * self.wheel_step, dy as f64 * self.wheel_step, modifiers)
+                self.chrome.wheel(x, y, dx as f64 * self.wheel_step, dy as f64 * self.wheel_step, modifiers);
+                let native = (
+                    (self.viewport.0 as f64 * self.scale).round() as u32,
+                    (self.viewport.1 as f64 * self.scale).round() as u32,
+                );
+                if self.preview_enabled
+                    && self.focused
+                    && self.route == Route::LayerFiles
+                    && self.scroll_capture.wheel(Instant::now(), native)
+                {
+                    self.chrome.scroll_capture(self.scroll_capture.preview);
+                }
             }
         }
         false
