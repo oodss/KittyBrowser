@@ -16,6 +16,7 @@ mod headless;
 mod history;
 mod keys;
 mod mcp;
+mod motion;
 mod scroll;
 mod skill;
 mod term;
