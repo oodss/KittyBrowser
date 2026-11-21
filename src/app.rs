@@ -185,6 +185,7 @@ enum Msg {
     Control(Request),
     ChromeClosed,
     OutputReady {
+        written_at: Instant,
         files_failed: bool,
     },
     Repaint,
@@ -227,6 +228,16 @@ fn log(line: std::fmt::Arguments) {
     if let Some(file) = file {
         let _ = writeln!(file.lock().unwrap(), "{line}");
     }
+}
+
+/// A retry click refers to the + the user saw. Its column can change when
+/// the first tab strip appears. Keep that layout until the writer has sent
+/// the result, and compare against the time the terminal reader saw the click.
+struct TabButtonPress {
+    request: u64,
+    windows: (usize, usize),
+    button: Button,
+    drawn_at: Option<Instant>,
 }
 
 struct App {
@@ -316,6 +327,7 @@ struct App {
     asking_quit: bool,
     tab_strip: bool,
     opening_tab: Option<(u64, Instant)>,
+    tab_button: Option<TabButtonPress>,
     quit_clicked: bool,
 }
 
@@ -484,6 +496,7 @@ fn browse(
         asking_quit: false,
         tab_strip: false,
         opening_tab: None,
+        tab_button: None,
         quit_clicked: false,
     };
     if let Some(dark) = options.dark {
@@ -524,6 +537,8 @@ fn browse(
     // only app.frame and the dirty flags change, so the next draw is current.
     frames.send(app.draw(false, false)).map_err(|_| "terminal writer stopped")?;
     let mut writing = true;
+    let mut writing_tab_result = None;
+    let mut toolbar_first = false;
     let (mut new_frame, mut redraw) = (false, false);
 
     let mut checked = Instant::now();
@@ -598,6 +613,11 @@ fn browse(
                     continue;
                 }
             }
+            if let Msg::Term(Event::Mouse(mouse), at) = &message {
+                if app.consume_tab_retry(*mouse, *at) {
+                    continue;
+                }
+            }
             if (app.opening_tab.is_some() || !tab_input.is_empty())
                 && matches!(message, Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_), _))
             {
@@ -631,7 +651,12 @@ fn browse(
                         Some(Msg::Term(Event::Mouse(Mouse { kind: MouseKind::Move, button: None, .. }), _))
                     );
                     if !(next_is_hover && app.buttons == 0 && mouse.kind == MouseKind::Move && mouse.button.is_none()) {
-                        redraw |= app.on_mouse(mouse, at);
+                        let changed = app.on_mouse(mouse, at);
+                        redraw |= changed;
+                        // Let a local button show its result before preparing
+                        // another image of the animated page beneath it.
+                        toolbar_first |=
+                            changed && mouse.kind == MouseKind::Press && app.toolbar_column(mouse).is_some();
                     }
                     if app.quit_clicked {
                         quit = Some(Ok(()));
@@ -826,6 +851,7 @@ fn browse(
                         Some(PageEvent::Created(id, url)) => {
                             if app.opening_tab.is_some_and(|(pending, _)| pending == id) {
                                 app.opening_tab = None;
+                                toolbar_first = true;
                             }
                             app.shown(url);
                             redraw = true;
@@ -847,8 +873,13 @@ fn browse(
                 }
                 Msg::MotionReports(_) => unreachable!("expanded on receipt"),
                 Msg::Repaint => new_frame = true,
-                Msg::OutputReady { files_failed } => {
-                    receipt.written(Instant::now());
+                Msg::OutputReady { files_failed, written_at } => {
+                    receipt.written(written_at);
+                    if let Some(id) = writing_tab_result.take() {
+                        if let Some(press) = app.tab_button.as_mut().filter(|press| press.request == id) {
+                            press.drawn_at = Some(written_at);
+                        }
+                    }
                     writing = false;
                     if files_failed {
                         app.route = app.route.without_files();
@@ -918,13 +949,23 @@ fn browse(
         }
         // Keep the last page visible behind the quit question. A confirmation
         // should cost one text update even when Chrome is animating underneath.
-        let paint_page = new_frame && !app.asking_quit && receipt.allows_frame(Instant::now());
+        let paint_page = new_frame
+            && !toolbar_first
+            && app.opening_tab.is_none()
+            && !app.asking_quit
+            && receipt.allows_frame(Instant::now());
         if !writing && (paint_page || redraw || app.output.any()) {
             let query = paint_page && app.frame.is_some() && receipt.request();
             if frames.send(app.draw(paint_page, query)).is_err() {
                 break Err("terminal writer stopped".to_owned());
             }
             writing = true;
+            writing_tab_result = app
+                .tab_button
+                .as_ref()
+                .filter(|press| app.opening_tab.is_none() && press.drawn_at.is_none())
+                .map(|press| press.request);
+            toolbar_first = false;
             if paint_page {
                 new_frame = false;
             }
@@ -966,7 +1007,7 @@ impl App {
 
     /// Pacing the acknowledgements lets Chrome skip work between frames.
     fn frame_gap(&self) -> Duration {
-        if !self.focused {
+        if !self.focused || self.opening_tab.is_some() {
             UNFOCUSED_GAP
         } else if self.last_input.elapsed() < ACTIVE {
             Duration::ZERO
@@ -1330,7 +1371,9 @@ impl App {
         let mut out = Vec::new();
         let cols = self.window.cols as usize;
         let mut badge = String::new();
-        if let Some((note, _)) = &self.notice {
+        if self.opening_tab.is_some() {
+            badge.push_str("Opening tab… ");
+        } else if let Some((note, _)) = &self.notice {
             badge.push_str(note);
             badge.push(' ');
         } else if self.inspecting {
@@ -1669,6 +1712,42 @@ impl App {
         }
     }
 
+    fn mouse_pixels(&self, mouse: Mouse) -> (f64, f64) {
+        let (cell_w, cell_h) = self.cell();
+        let (cell_w, cell_h) = (cell_w as f64, cell_h as f64);
+        // Position in device pixels from the pane's top left. Cell reports
+        // are taken at the middle of the cell.
+        if self.pixel_mouse {
+            (mouse.x as f64, mouse.y as f64)
+        } else {
+            ((mouse.x as f64 - 0.5) * cell_w, (mouse.y as f64 - 0.5) * cell_h)
+        }
+    }
+
+    fn toolbar_column(&self, mouse: Mouse) -> Option<usize> {
+        let (px, py) = self.mouse_pixels(mouse);
+        let (width, height) = self.cell();
+        (py < f64::from(height)).then(|| (px / f64::from(width)) as usize + 1)
+    }
+
+    fn consume_tab_retry(&mut self, mouse: Mouse, at: Instant) -> bool {
+        let Some(press) = &self.tab_button else { return false };
+        let repeated = mouse.button == Some(press.button)
+            && matches!(mouse.kind, MouseKind::Press | MouseKind::Release)
+            && press.drawn_at.is_none_or(|drawn| at <= drawn)
+            && self
+                .toolbar_column(mouse)
+                .is_some_and(|col| ui::hit(col, self.window.cols as usize, press.windows) == Hit::NewTab);
+        // A repeat still belongs to the same open request after a slow
+        // attach. Start the lost-reply timeout from the last such press.
+        if repeated && mouse.kind == MouseKind::Press {
+            if let Some((_, last)) = self.opening_tab.as_mut().filter(|(id, _)| *id == press.request) {
+                *last = (*last).max(at);
+            }
+        }
+        repeated
+    }
+
     /// Returns whether the top bar needs redrawing.
     fn on_mouse(&mut self, mouse: Mouse, at: Instant) -> bool {
         // A click closes the help, and does nothing else.
@@ -1681,13 +1760,7 @@ impl App {
         }
         let (cell_w, cell_h) = self.cell();
         let (cell_w, cell_h) = (cell_w as f64, cell_h as f64);
-        // Position in device pixels from the pane's top left. Cell reports
-        // are taken at the middle of the cell.
-        let (px, py) = if self.pixel_mouse {
-            (mouse.x as f64, mouse.y as f64)
-        } else {
-            ((mouse.x as f64 - 0.5) * cell_w, (mouse.y as f64 - 0.5) * cell_h)
-        };
+        let (px, py) = self.mouse_pixels(mouse);
         if self.asking_quit || (self.buttons == 0 && py < cell_h * if self.tab_strip { 2.0 } else { 1.0 }) {
             self.discard_motion();
         }
@@ -1737,10 +1810,14 @@ impl App {
             if ui::hit(col, self.window.cols as usize, self.chrome.windows()) == Hit::NewTab
                 && mouse.kind == MouseKind::Press
             {
-                match mouse.button {
-                    Some(Button::Left) => return self.perform(Action::NewTab),
-                    Some(Button::Right) => return self.perform(Action::RestoreTab),
-                    _ => {}
+                if let Some(button @ (Button::Left | Button::Right)) = mouse.button {
+                    let windows = self.chrome.windows();
+                    let changed =
+                        self.perform(if button == Button::Left { Action::NewTab } else { Action::RestoreTab });
+                    if let Some((request, _)) = self.opening_tab {
+                        self.tab_button = Some(TabButtonPress { request, windows, button, drawn_at: None });
+                    }
+                    return changed;
                 }
             }
             if mouse.kind != MouseKind::Press || mouse.button != Some(Button::Left) {

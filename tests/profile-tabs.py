@@ -38,7 +38,7 @@ def wait_for(predicate):
         try:
             if predicate():
                 return
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass  # Chrome is starting or replacing the page's execution context.
         time.sleep(0.05)
     raise AssertionError(f"condition timed out at line {predicate.__code__.co_firstlineno}")
@@ -83,6 +83,18 @@ def check(folder, base):
         os.write(master, b"\x14\x1b[200~" + (base + "/second").encode() + b"\x1b[201~\r")
         page("/second")
         assert ctl("eval", "document.querySelector('#login').textContent") == "yes"
+
+        # All three presses saw the same multi-tab toolbar. A paste behind
+        # them belongs in the one new tab, as it does immediately after Ctrl+T.
+        wait_for(lambda: "2 open, this is 2" in ctl("status"))
+        plus = b"\x1b[<0;69;1M\x1b[<0;69;1m"
+        os.write(master, plus * 3 + b"\x1b[200~" + (base + "/burst").encode() + b"\x1b[201~\r")
+        page("/burst")
+        status = ctl("status")
+        assert "3 open, this is 3" in status, status
+        os.write(master, b"\x17")
+        page("/second")
+
         ctl("open", base + "/third")
         page("/third")
         ctl("back")
