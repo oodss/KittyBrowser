@@ -8,7 +8,7 @@
 use super::cdp::{Receiver, Sender};
 use crate::term::input::{Key, KeyCode};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -23,6 +23,9 @@ pub enum PageEvent {
     Frame(String),
     Url(String),
     Loading(bool),
+    TabsChanged,
+    Created(u64, String),
+    CreateFailed(u64, String),
     /// Another window is shown now, at this URL: one a page opened, or the
     /// one under a window that closed.
     Shown(String),
@@ -40,6 +43,7 @@ struct Tab {
     session: String,
     target: String,
     main_frame: String,
+    title: String,
     url: String,
     window: Option<Window>,
     /// Whether the HTTP cache is switched off, as it is on local pages.
@@ -60,7 +64,15 @@ pub struct Chrome {
     settings: Vec<(&'static str, Value)>,
     /// The ids of the replies saying which window holds a page just
     /// attached to, and where the shown one can go back to.
-    window_request: Option<(u64, String)>,
+    window_requests: HashMap<u64, String>,
+    // Inspect native visibility before focus emulation makes every target appear
+    // focused. A user switch takes precedence over a late visibility reply.
+    visibility_requests: HashMap<u64, (String, u64)>,
+    selection_epoch: u64,
+    creating: HashMap<u64, Option<String>>,
+    created_targets: HashMap<String, u64>,
+    closing: HashSet<String>,
+    last_closed: Option<String>,
     history_request: Option<u64>,
     /// Whether frames wait for `ack` rather than being acknowledged as they
     /// arrive, and the acknowledgements waiting, oldest first. Chrome sends
@@ -500,11 +512,25 @@ impl Chrome {
         let chrome = Chrome {
             child,
             tx,
-            tabs: vec![Tab { session, target, main_frame, url: String::new(), window, cache_off: false }],
+            tabs: vec![Tab {
+                session,
+                target,
+                main_frame,
+                title: String::new(),
+                url: String::new(),
+                window,
+                cache_off: false,
+            }],
             shown: 0,
             opening: HashSet::new(),
             settings,
-            window_request: None,
+            window_requests: HashMap::new(),
+            visibility_requests: HashMap::new(),
+            selection_epoch: 0,
+            creating: HashMap::new(),
+            created_targets: HashMap::new(),
+            closing: HashSet::new(),
+            last_closed: None,
             history_request: None,
             hold_acks: false,
             unacked: Default::default(),
@@ -557,6 +583,36 @@ impl Chrome {
         (self.shown + 1, self.tabs.len())
     }
 
+    pub fn tab_label(&self, at: usize) -> &str {
+        let tab = &self.tabs[at];
+        if !tab.title.is_empty() && tab.title != "about:blank" {
+            &tab.title
+        } else if tab.url.is_empty() || tab.url == "about:blank" {
+            "New tab"
+        } else {
+            &tab.url
+        }
+    }
+
+    /// A target in the existing browser context shares cookies and storage.
+    /// Restoring loads the last explicitly closed URL in a fresh target.
+    pub fn new_tab(&mut self, restore: bool) -> Result<u64, String> {
+        let closed = if restore { Some(self.last_closed.take().ok_or("No closed tab to reopen")?) } else { None };
+        let url = closed.as_deref().unwrap_or("about:blank");
+        match self.tx.send("Target.createTarget", json!({"url": url, "background": false}), None) {
+            Ok(id) => {
+                self.creating.insert(id, closed);
+                Ok(id)
+            }
+            Err(error) => {
+                if closed.is_some() {
+                    self.last_closed = closed;
+                }
+                Err(format!("Could not open tab: {error}"))
+            }
+        }
+    }
+
     /// Whether the app should look at this message: replies, the browser's
     /// own events, and events from the window shown, not from the others.
     pub fn shown(&self, message: &Value) -> bool {
@@ -595,9 +651,23 @@ impl Chrome {
             if self.history_request == Some(id) {
                 self.history_request = None;
                 self.back_from(&message["result"]);
-            } else if self.window_request.as_ref().is_some_and(|(asked, _)| *asked == id) {
-                let (_, target) = self.window_request.take()?;
+            } else if let Some(target) = self.window_requests.remove(&id) {
                 self.found_window(&target, &message["result"]);
+            } else if let Some((target, epoch)) = self.visibility_requests.remove(&id) {
+                if epoch == self.selection_epoch && message["result"]["result"]["value"] != "hidden" {
+                    let at = self.tabs.iter().position(|tab| tab.target == target)?;
+                    return self.show(at);
+                }
+            } else if let Some(closed) = self.creating.remove(&id) {
+                if let Some(reason) = message["error"]["message"].as_str() {
+                    if self.last_closed.is_none() {
+                        self.last_closed = closed;
+                    }
+                    return Some(PageEvent::CreateFailed(id, format!("Could not open tab: {reason}")));
+                }
+                let target = message["result"]["targetId"].as_str()?;
+                self.created_targets.insert(target.to_owned(), id);
+                return self.created(target);
             }
             return None;
         }
@@ -660,7 +730,12 @@ impl Chrome {
                     return None;
                 }
                 let session = params["sessionId"].as_str()?.to_owned();
-                self.open(session, target.to_owned(), info["url"].as_str().unwrap_or("").to_owned())
+                self.open(
+                    session,
+                    target.to_owned(),
+                    info["url"].as_str().unwrap_or(""),
+                    info["title"].as_str().unwrap_or(""),
+                )
             }
             "Target.targetInfoChanged" => {
                 // Pages under the one shown can move on too, such as the one
@@ -670,15 +745,27 @@ impl Chrome {
                 let id = info["targetId"].as_str()?;
                 let url = info["url"].as_str()?;
                 let at = self.tabs.iter().position(|tab| tab.target == id)?;
-                if self.tabs[at].url == url {
-                    return None;
+                let tab = &mut self.tabs[at];
+                let title = info["title"].as_str().unwrap_or("");
+                let changed_title = tab.title != title;
+                if changed_title {
+                    tab.title = title.to_owned();
                 }
-                self.tabs[at].url = url.to_owned();
-                (at == self.shown).then(|| PageEvent::Url(url.to_owned()))
+                if tab.url != url {
+                    tab.url = url.to_owned();
+                    if at == self.shown {
+                        return Some(PageEvent::Url(url.to_owned()));
+                    }
+                    return Some(PageEvent::TabsChanged);
+                }
+                changed_title.then_some(PageEvent::TabsChanged)
             }
             "Target.targetDestroyed" | "Target.detachedFromTarget" => {
                 let id = params["targetId"].as_str()?;
                 self.opening.remove(id);
+                if let Some(request) = self.created_targets.remove(id) {
+                    return Some(PageEvent::CreateFailed(request, "New tab closed before it opened".into()));
+                }
                 self.closed(id)
             }
             _ => None,
@@ -686,18 +773,46 @@ impl Chrome {
     }
 
     /// Show a window a page opened, next to the one it opened it from.
-    fn open(&mut self, session: String, target: String, url: String) -> Option<PageEvent> {
+    fn open(&mut self, session: String, target: String, url: &str, title: &str) -> Option<PageEvent> {
+        if let Ok(id) = self.tx.send(
+            "Runtime.evaluate",
+            json!({"expression":"document.visibilityState","returnByValue":true}),
+            Some(&session),
+        ) {
+            self.visibility_requests.insert(id, (target.clone(), self.selection_epoch));
+        }
         for (method, params) in &self.settings {
             let _ = self.tx.send(method, params.clone(), Some(&session));
         }
-        let asked = self.tx.send("Browser.getWindowForTarget", json!({"targetId": target}), None);
-        self.window_request = asked.ok().map(|id| (id, target.clone()));
+        if let Ok(id) = self.tx.send("Browser.getWindowForTarget", json!({"targetId": target}), None) {
+            self.window_requests.insert(id, target.clone());
+        }
         let main_frame = target.clone();
-        let tab = Tab { session, target, main_frame, url: url.clone(), window: None, cache_off: false };
-        self.tabs.insert(self.shown + 1, tab);
-        let event = self.show(self.shown + 1);
-        self.cache_for(&url);
-        event
+        self.tabs.insert(
+            self.shown + 1,
+            Tab {
+                session,
+                target: target.clone(),
+                main_frame,
+                title: title.to_owned(),
+                url: url.to_owned(),
+                window: None,
+                cache_off: false,
+            },
+        );
+        self.created(&target).or(Some(PageEvent::TabsChanged))
+    }
+
+    // Creation and discovery report the same target independently. Only
+    // release queued input after we have both its request ID and its session.
+    fn created(&mut self, target: &str) -> Option<PageEvent> {
+        let at = self.tabs.iter().position(|tab| tab.target == target)?;
+        let request = self.created_targets.remove(target)?;
+        self.visibility_requests.retain(|_, (tab, _)| tab != target);
+        if at != self.shown {
+            self.show(at);
+        }
+        Some(PageEvent::Created(request, self.tabs[at].url.clone()))
     }
 
     /// Show the window at `at` in place of the one shown. The others keep
@@ -709,6 +824,9 @@ impl Chrome {
         }
         self.unacked.clear();
         self.shown = at;
+        self.history_request = None;
+        let url = self.tabs[at].url.clone();
+        self.cache_for(&url);
         if let Some(params) = self.screencast.clone() {
             self.send("Page.startScreencast", params);
         }
@@ -723,6 +841,15 @@ impl Chrome {
             return None;
         }
         let at = (self.shown as isize + step).rem_euclid(count) as usize;
+        self.select(at)
+    }
+
+    pub fn select(&mut self, at: usize) -> Option<PageEvent> {
+        if at >= self.tabs.len() || at == self.shown {
+            return None;
+        }
+        self.selection_epoch += 1;
+        self.send_browser("Target.activateTarget", json!({"targetId": self.tabs[at].target}));
         self.show(at)
     }
 
@@ -754,16 +881,19 @@ impl Chrome {
         if self.tabs.len() == 1 {
             return None;
         }
-        self.tabs.remove(at);
+        let tab = self.tabs.remove(at);
+        if self.closing.remove(target) {
+            self.last_closed = Some(if tab.url.is_empty() { "about:blank".into() } else { tab.url });
+        }
         if at < self.shown {
             self.shown -= 1;
-            None
+            Some(PageEvent::TabsChanged)
         } else if at == self.shown {
             // Its screencast went with it.
             self.shown = usize::MAX;
-            self.show(at.saturating_sub(1))
+            self.select(at.saturating_sub(1))
         } else {
-            None
+            Some(PageEvent::TabsChanged)
         }
     }
 
@@ -783,6 +913,7 @@ impl Chrome {
     /// the one shown next, once it has closed, is.
     pub fn close_window(&mut self) -> String {
         let target = self.tabs[self.shown].target.clone();
+        self.closing.insert(target.clone());
         self.send_browser("Target.closeTarget", json!({"targetId": target}));
         self.tabs[self.shown.saturating_sub(1)].url.clone()
     }

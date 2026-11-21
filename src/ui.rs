@@ -13,6 +13,7 @@ const RELOAD: std::ops::RangeInclusive<usize> = 7..=9;
 const FIELD: usize = 11;
 /// The close button, at the right end: a space, the cross, a space.
 const CLOSE: usize = 3;
+const NEW_TAB: usize = 3;
 /// Panes narrower than this get an empty bar.
 const MIN_COLS: usize = 20;
 
@@ -21,6 +22,7 @@ pub enum Hit {
     Back,
     Forward,
     Reload,
+    NewTab,
     Close,
     /// The window switcher's halves.
     PreviousWindow,
@@ -61,10 +63,59 @@ pub fn hit(col: usize, cols: usize, windows: (usize, usize)) -> Hit {
         } else {
             Hit::NextWindow
         }
+    } else if col >= switcher_start - NEW_TAB {
+        Hit::NewTab
     } else if (FIELD..=cols - CLOSE).contains(&col) {
         Hit::Address(col.saturating_sub(FIELD + 1))
     } else {
         Hit::Nothing
+    }
+}
+
+/// The same cells drive drawing and clicks. On a narrow pane the strip
+/// shows a slice containing the active tab; the arrow buttons still cycle all tabs.
+pub struct TabStrip {
+    start: usize,
+    count: usize,
+    width: usize,
+}
+
+impl TabStrip {
+    pub fn new(cols: usize, active: usize, total: usize) -> Self {
+        let count = (cols / 14).max(1).min(total);
+        let start = active.saturating_sub(count / 2).min(total - count);
+        Self { start, count, width: (cols / count).clamp(1, 28) }
+    }
+
+    pub fn at(&self, col: usize) -> Option<usize> {
+        let slot = col / self.width;
+        (slot < self.count).then_some(self.start + slot)
+    }
+
+    pub fn render<'a>(&self, out: &mut Vec<u8>, active: usize, label: impl Fn(usize) -> &'a str) {
+        use unicode_width::UnicodeWidthStr;
+        let colors = palette();
+        let mut line = format!("\x1b[2;1H{}\x1b[2K", colors.bar);
+        for slot in 0..self.count {
+            let tab = self.start + slot;
+            let style = if tab == active { &colors.focused } else { &colors.bar };
+            let mut text = String::new();
+            // Titles come from websites. Bound both terminal columns and input
+            // length (a title could contain thousands of combining marks).
+            let room = self.width.saturating_sub(2);
+            for ch in label(tab).chars().take(128).filter(|c| !c.is_control()) {
+                text.push(ch);
+                if text.width() > room {
+                    text.pop();
+                    break;
+                }
+            }
+            let mark = if tab == active { '●' } else { ' ' };
+            let pad = self.width - 1 - text.width();
+            let _ = write!(line, "\x1b[2;{}H{style}{mark}{text}{:pad$}", 1 + slot * self.width, "");
+        }
+        line.push_str("\x1b[0m");
+        out.extend_from_slice(line.as_bytes());
     }
 }
 
@@ -447,7 +498,7 @@ pub fn render_bar(
     let switcher_width = switcher.as_ref().map_or(0, |text| text.chars().count());
     let badge = badge.filter(|badge| cols > MIN_COLS + switcher_width + badge.chars().count());
     let badge_width = badge.map_or(0, |badge| badge.chars().count() + 1);
-    let width = cols - FIELD - 2 - CLOSE - badge_width - switcher_width;
+    let width = cols - FIELD - 2 - CLOSE - NEW_TAB - badge_width - switcher_width;
     let window = bar.window(width);
     let shown: Vec<char> = bar.text.iter().chain(&bar.completion).copied().collect();
     let typed_end = bar.text.len().clamp(window.start, window.end);
@@ -469,6 +520,7 @@ pub fn render_bar(
     if let Some(badge) = badge {
         let _ = write!(s, "{badge} ");
     }
+    s.push_str(" + ");
     if let Some(switcher) = switcher {
         s.push_str(&switcher);
     }
@@ -723,12 +775,13 @@ mod tests {
         assert_eq!(hit(10, 80, (1, 1)), Hit::Nothing);
         assert_eq!(hit(11, 80, (1, 1)), Hit::Address(0));
         assert_eq!(hit(14, 80, (1, 1)), Hit::Address(2));
-        assert_eq!(hit(77, 80, (1, 1)), Hit::Address(65));
+        assert_eq!(hit(74, 80, (1, 1)), Hit::Address(62));
+        assert_eq!(hit(77, 80, (1, 1)), Hit::NewTab);
         assert_eq!(hit(78, 80, (1, 1)), Hit::Close);
         assert_eq!(hit(80, 80, (1, 1)), Hit::Close);
         assert_eq!(hit(81, 80, (1, 1)), Hit::Nothing);
         // "‹ 2/3 ›" takes columns 71 to 77, before ✕.
-        assert_eq!(hit(70, 80, (2, 3)), Hit::Address(58));
+        assert_eq!(hit(70, 80, (2, 3)), Hit::NewTab);
         assert_eq!(hit(71, 80, (2, 3)), Hit::PreviousWindow);
         assert_eq!(hit(73, 80, (2, 3)), Hit::PreviousWindow);
         assert_eq!(hit(74, 80, (2, 3)), Hit::NextWindow);
@@ -742,6 +795,21 @@ mod tests {
         assert_eq!(answer(15, "Quit?"), Some(false));
         assert_eq!(answer(18, "Quit?"), Some(false));
         assert_eq!(answer(19, "Quit?"), None);
+    }
+
+    #[test]
+    fn tab_labels_and_clicks_share_the_same_visible_slice() {
+        let strip = TabStrip::new(36, 4, 8);
+        assert_eq!(strip.at(0), Some(3));
+        assert_eq!(strip.at(18), Some(4));
+        assert_eq!(strip.at(36), None);
+        let mut out = Vec::new();
+        strip.render(&mut out, 4, |i| if i == 4 { "東京\x1b]52;payload\x07" } else { "Previous tab" });
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("●東京"));
+        assert!(!text.contains("\x1b]52"));
+        assert!(!text.contains('\x07'));
+        assert_eq!(TabStrip::new(1, 7, 8).at(0), Some(7));
     }
 
     #[test]

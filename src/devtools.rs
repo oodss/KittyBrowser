@@ -1150,10 +1150,9 @@ impl Devtools {
                     }
                     let windows = match chrome.windows() {
                         (_, 1) => "\nwindows: 1 open".to_owned(),
-                        (shown, open) => format!(
-                            "\nwindows: {open} open, this is {shown} (a popup or new tab the page opened; \
-                             back on its first page closes it)"
-                        ),
+                        (shown, open) => {
+                            format!("\nwindows: {open} open, this is {shown} (back on its first page closes it)")
+                        }
                     };
                     rest.push_str(&windows);
                     if let Some(id) = crate::control::id() {
